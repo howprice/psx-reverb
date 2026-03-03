@@ -18,7 +18,6 @@ FIR Finite Impulse Response
 
 TODO
 ====
-- Stereo
 - Reflection filters
 - Comb filters
 - All pass filters
@@ -55,7 +54,8 @@ static const s16 kFiniteImpulseResponse[] =
 	 0x0534,  0x0000, -0x0268,  0x0000,  0x010A,  0x0000, -0x0067,  0000,
 	 0x0023,  0x0000, -0x000A,  0x0000,  0x0002,  0x0000, -0x0001,
 };
-static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == 39);
+static const unsigned int kFIRFilterSize = 39;
+static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == kFIRFilterSize);
 
 // Reverb Volume and Address Registers (R/W)
 //
@@ -147,88 +147,6 @@ struct ReverbRegisters
 	s16 vRIN;
 };
 
-// Processes a whole buffer
-[[maybe_unused]]
-static bool downsampleBuffer(
-	const s16* input, size_t inputLength,
-	s16* output, size_t outputCapacity, size_t& outputLength)
-{
-	outputLength = inputLength / 2; // Downsample by 2, so output length is half of input length
-	if (outputCapacity < outputLength)
-	{
-		LOG_ERROR("Output capacity is too small for downsampled output. Required: %zu samples, provided: %zu samples\n", outputLength, outputCapacity);
-		return false;
-	}
-
-	// Resample from 44100 to 22050 Hz by convolving with impulse response and downsampling by 2.
-	for (size_t i = 0; i < outputLength; i++)
-	{
-		s32 sum = 0;
-		for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
-		{
-			// Step input by 2 for downsampling.
-			// 
-			// n.b. The filter is not centered so introduced a delay. To center the filter input index would need to
-			// be offset by 19 (half of 39) but this would cause negative input index for the first 19 output samples,
-			// so we start with input index of 0 and let the filter introduce the delay.
-			s64 inputIndex = (s64)(2 * i) - (s64)j;
-
-			s16 inputSample = (inputIndex >= 0 && inputIndex < (s64)inputLength) ? input[inputIndex] : 0;
-			sum += (s32)inputSample * (s32)kFiniteImpulseResponse[j];
-		}
-
-		sum >>= 15; // Rescale by 0x8000
-		output[i] = (s16)Clamp(sum, (s32)INT16_MIN, (s32)INT16_MAX); // Saturate to 16-bit signed range
-	}
-
-	return true;
-}
-
-// Processes a whole buffer
-[[maybe_unused]]
-static bool upsampleBuffer(
-	const s16* input, size_t inputLength,
-	s16* output, size_t outputCapacity, size_t& outputLength)
-{
-	// Upsample 2x by "stuffing" every other element with zeros.
-	if (outputCapacity < inputLength * 2)
-	{
-		LOG_ERROR("Output capacity is too small for upsampled output. Required: %zu samples, provided: %zu samples\n", inputLength * 2, outputCapacity);
-		return false;
-	}
-
-	outputLength = inputLength * 2; // Upsample by 2, so output length is double the input length
-
-	// Resample from 22050 Hz to 44100 Hz by upsampling by 2 and convolving with impulse response.
-	for (size_t i = 0; i < outputLength; i++)
-	{
-		s32 sum = 0;
-		for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
-		{
-			s64 zeroStuffedIndex = (s64)i - (s64)j;
-
-			// Check if this position would have an actual sample (even index in zero-stuffed signal).
-			if (zeroStuffedIndex >= 0 && (zeroStuffedIndex & 1) == 0)
-			{
-				size_t inputIndex = (size_t)zeroStuffedIndex / 2; // Divide by 2 to get corresponding input index for zero-stuffed signal
-				HP_DEBUG_ASSERT(inputIndex < inputLength); // should never fail by construction
-				s16 inputSample = input[inputIndex];
-				sum += (s32)inputSample * (s32)kFiniteImpulseResponse[j];
-			}
-			// else zero-stuffed sample, so contributes nothing to the sum
-		}
-
-		// The coefficients in the FIR table represent volume multipler N/0x8000 so should rescale by dividing by 0x8000 (shifting right by 15) to compensate for this.
-		// However, because of the zero stuffing, everuy other sample in the input is zero, the volume will be halved compared to the downsampled signal,
-		// so instead of rescaling by 0x8000, we can rescale by 0x4000 (shifting right by 14)
-		sum >>= 14; 
-
-		output[i] = (s16)Clamp(sum, (s32)INT16_MIN, (s32)INT16_MAX); // Saturate to 16-bit signed range
-	}
-
-	return true;
-}
-
 static bool loadInput(const char* filename, s16*& buffer, size_t& numElements)
 {
 	FILE* file = fopen(filename, "rb");
@@ -305,12 +223,18 @@ int main(int argc, char** argv)
 
 	const char* inputFilename = argv[1];
 	s16* input;
-	size_t inputLengthSamples; // Each sample is 2 bytes (16 bits)
+	size_t inputLengthSamples;
 	if (!loadInput(inputFilename, /*out*/input, /*out*/inputLengthSamples))
 	{
 		LOG_ERROR("Failed to load input file: %s\n", inputFilename);
 		return EXIT_FAILURE;
 	}
+	if (inputLengthSamples & 1)
+	{
+		LOG_ERROR("Expect stereo input data. Number of samples is not even: %zu\n", inputLengthSamples);
+		return EXIT_FAILURE;
+	}
+	size_t inputLengthFrames = inputLengthSamples >> 1; // stereo
 
 	ReverbRegisters regs{};
 
@@ -324,29 +248,44 @@ int main(int argc, char** argv)
 	regs.vLOUT = 0x7fff;
 	regs.vROUT = 0x7fff;
 
+	s16 downsamplerRingbufferL[kFIRFilterSize]{};
+	s16 downsamplerRingbufferR[kFIRFilterSize]{};
+	unsigned int downsamplerRingbufferIndex = 0; // Circular buffer index for downsampler input
+
+	s16 upsamplerRingbufferL[kFIRFilterSize]{};
+	s16 upsamplerRingbufferR[kFIRFilterSize]{};
+	unsigned int upsamplerRingbufferIndex = 0; // Circular buffer index for upsampler input
+
 	// Create some intermediate buffers for debugging
 
+	// Debug buffer
 	// For full convolution, the length of the output signal is equal to the length of the input signal, plus the length of the impulse response, minus one.
 	// However we are downsampling by 2, so the output length is half of the input length. We can calculate the output capacity based on this.
-	const size_t downsampledBufferCapacity = inputLengthSamples / 2; // Downsample by 2, so output capacity is half of input length
-	s16* downsampledBuffer = new s16[downsampledBufferCapacity];
-	size_t downsampledBufferLen = 0; // Will be set by downsample function
+	const size_t downsampledBufferCapacitySamples = inputLengthSamples / 2; // Downsample by 2, so output capacity is half of input length
+	s16* downsampledBuffer = new s16[downsampledBufferCapacitySamples]; // single buffer containing stereo samplees
+	size_t downsampledBufferLenSamples = 0; // Will be set by downsample function
 
+	// Debug buffer
 	// Reverb is performed at 22050 Hz
-	const size_t reverbOutputBufferCapacitySamples = downsampledBufferCapacity;
+	const size_t reverbOutputBufferCapacitySamples = downsampledBufferCapacitySamples;
 	s16* reverbOutputBuffer = new s16[reverbOutputBufferCapacitySamples];
-	size_t reverbOutputBufferLen = 0;
+	size_t reverbOutputBufferLenSamples = 0;
 
+	// Debug buffer
 	// Final output from reverb output upsampled back to 44100 Hz
-	const size_t upsampledBufferCapacity = inputLengthSamples; // Upsample by 2, so output capacity is double the downsampled length
-	s16* upsampledBuffer = new s16[upsampledBufferCapacity]; // Upsample by 2, so output capacity is double the downsampled length
-	size_t upsampledBufferLen = 0;
+	const size_t upsampledBufferCapacitySamples = inputLengthSamples; // Upsample by 2, so output capacity is double the downsampled length
+	s16* upsampledBuffer = new s16[upsampledBufferCapacitySamples]; // Upsample by 2, so output capacity is double the downsampled length
+	size_t upsampledBufferLenSamples = 0;
 
-	// This would run at 44100 Hz
-	for (unsigned int inputSampleIndex = 0; inputSampleIndex < inputLengthSamples; inputSampleIndex++)
+	// This would be called at 44100 Hz, every 768 cycles on PSX
+	for (unsigned int inputFrameIndex = 0; inputFrameIndex < inputLengthFrames; inputFrameIndex++)
 	{
+		// The downsampler ring buffers must be fed every tick.
+		downsamplerRingbufferL[downsamplerRingbufferIndex] = input[2 * inputFrameIndex]; // Left sample of current stereo frame
+		downsamplerRingbufferR[downsamplerRingbufferIndex] = input[2 * inputFrameIndex + 1]; // Right sample of current stereo frame
+
 		// Reverb is processed every other cycle i.e. at 22050 Hz
-		if ((inputSampleIndex & 1) == 0)
+		if ((inputFrameIndex & 1) == 0)
 		{
 			// Downsample from 44100 Hz to 22050 Hz to calculate the reverb unit input.
 			s32 LeftInput = 0; // input to reverb unit
@@ -354,19 +293,24 @@ int main(int argc, char** argv)
 			{
 				for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
 				{
-					// n.b. The filter is not centered so introduced a delay. To center the filter input index would need to
+					// n.b. The filter is not centered so introduces a delay. To center the filter input index would need to
 					// be offset by 19 (half of 39) but this would cause negative input index for the first 19 output samples,
 					// so we start with input index of 0 and let the filter introduce the delay.
-					s64 inputIndex = (s64)inputSampleIndex - (s64)j;
+					int inputIndex = (int)downsamplerRingbufferIndex - (int)j;
+					if (inputIndex < 0)
+						inputIndex += COUNTOF_ARRAY(downsamplerRingbufferL); // Wrap around; circular buffer
 
-					s16 inputSample = inputIndex >= 0 ? input[inputIndex] : 0;
-					LeftInput += (s32)inputSample * (s32)kFiniteImpulseResponse[j];
+					s32 h = (s32)kFiniteImpulseResponse[j]; // impulse response
+					LeftInput += (s32)downsamplerRingbufferL[inputIndex] * h;
+					RightInput += (s32)downsamplerRingbufferR[inputIndex] * h;
 				}
 
 				LeftInput >>= 15; // Rescale by 0x8000
+				RightInput >>= 15; // Rescale by 0x8000
 
-				HP_DEBUG_ASSERT(downsampledBufferLen < downsampledBufferCapacity); // should never fail by construction
-				downsampledBuffer[downsampledBufferLen++] = saturateS32toS16(LeftInput);
+				HP_DEBUG_ASSERT(downsampledBufferLenSamples + 2 <= downsampledBufferCapacitySamples); // should never fail by construction
+				downsampledBuffer[downsampledBufferLenSamples++] = saturateS32toS16(LeftInput);
+				downsampledBuffer[downsampledBufferLenSamples++] = saturateS32toS16(RightInput);
 			}
 
 			// Reverb
@@ -384,54 +328,72 @@ int main(int argc, char** argv)
 			s32 LeftOutput = (Lout * (s32)regs.vLOUT) >> 15; // / 0x8000;
 			s32 RightOutput = (Rout * (s32)regs.vROUT) >> 15; // / 0x8000;
 
-			// Write to reverb output buffer at 22050 Hz
-			// Here, this is a full size buffer, but in the PSX SPU this could be a small circular buffer large enough to store the 39 samples needed for the FIR filter/
-			HP_DEBUG_ASSERT(reverbOutputBufferLen < reverbOutputBufferCapacitySamples); // should never fail by construction
-			reverbOutputBuffer[reverbOutputBufferLen] = saturateS32toS16(LeftOutput);
-			HP_UNUSED(RightOutput); // #TODO: Stereo
-			reverbOutputBufferLen++;
+			// Write the new reverb output values into the upsampler ring buffers
+			upsamplerRingbufferL[upsamplerRingbufferIndex] = saturateS32toS16(LeftOutput);
+			upsamplerRingbufferR[upsamplerRingbufferIndex] = saturateS32toS16(RightOutput);
+
+			// Write to debug reverb output buffer at 22050 Hz
+			HP_DEBUG_ASSERT(reverbOutputBufferLenSamples + 2 <= reverbOutputBufferCapacitySamples); // should never fail by construction
+			reverbOutputBuffer[reverbOutputBufferLenSamples++] = upsamplerRingbufferL[upsamplerRingbufferIndex];
+			reverbOutputBuffer[reverbOutputBufferLenSamples++] = upsamplerRingbufferR[upsamplerRingbufferIndex];
+		}
+		else
+		{
+			// Zero stuffing for upsampling: every other sample is zero, so write zeros to the ring buffer for the odd cycles where reverb is not processed.
+			upsamplerRingbufferL[upsamplerRingbufferIndex] = 0;
+			upsamplerRingbufferR[upsamplerRingbufferIndex] = 0;
 		}
 
 		// Upsample from 22050 Hz back to 44100 Hz
 		// In the PSX SPU reverb unit, this is achieved with "zero stuffing" every other element and convolving with the same FIR filter.
 		{
-			s32 sum = 0;
+			s32 sumL = 0;
+			s32 sumR = 0;
 			for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
 			{
-				s64 zeroStuffedIndex = (s64)inputSampleIndex - (s64)j;
+				int inputIndex = (int)upsamplerRingbufferIndex - (int)j;
+				if (inputIndex < 0)
+					inputIndex += COUNTOF_ARRAY(upsamplerRingbufferL); // Wrap around; circular buffer
 
-				// Check if this position would have an actual sample (even index in zero-stuffed signal).
-				if (zeroStuffedIndex >= 0 && (zeroStuffedIndex & 1) == 0)
-				{
-					size_t reverbBufferIndex = (size_t)zeroStuffedIndex >> 1; // Divide by 2 to get corresponding input index for zero-stuffed signal
-					HP_DEBUG_ASSERT(reverbBufferIndex < reverbOutputBufferLen);
-					sum += (s32)reverbOutputBuffer[reverbBufferIndex] * (s32)kFiniteImpulseResponse[j];
-				}
-				// else zero-stuffed sample, so contributes nothing to the sum
+				s32 h = (s32)kFiniteImpulseResponse[j]; // impulse response
+				sumL += (s32)upsamplerRingbufferL[inputIndex] * h;
+				sumR += (s32)upsamplerRingbufferR[inputIndex] * h;
 			}
 
 			// The coefficients in the FIR table represent volume multipler N/0x8000 so should rescale by dividing by 0x8000 (shifting right by 15) to compensate for this.
-			// However, because of the zero stuffing, everuy other sample in the input is zero, the volume will be halved compared to the downsampled signal,
+			// However, because of the zero stuffing, every other sample in the input is zero, the volume will be halved compared to the downsampled signal,
 			// so instead of rescaling by 0x8000, we can rescale by 0x4000 (shifting right by 14)
-			sum >>= 14;
+			sumL >>= 14;
+			sumR >>= 14;
 
-			HP_DEBUG_ASSERT(upsampledBufferLen < upsampledBufferCapacity); // should never fail by construction
-			upsampledBuffer[upsampledBufferLen++] = (s16)Clamp(sum, (s32)INT16_MIN, (s32)INT16_MAX); // Saturate to 16-bit signed range
+			HP_DEBUG_ASSERT(upsampledBufferLenSamples + 2 <= upsampledBufferCapacitySamples); // should never fail by construction
+			upsampledBuffer[upsampledBufferLenSamples++] = saturateS32toS16(sumL);
+			upsampledBuffer[upsampledBufferLenSamples++] = saturateS32toS16(sumR);
 		}
+
+		// Increment this after calculating the output sample for the current input, so that the current input is included in the FIR filter calculation for the next output sample.
+		downsamplerRingbufferIndex++;
+		if (downsamplerRingbufferIndex == COUNTOF_ARRAY(downsamplerRingbufferL))
+			downsamplerRingbufferIndex = 0;
+
+		// Increment this after calculating the output sample for the current input, so that the current input is included in the FIR filter calculation for the next output sample.
+		upsamplerRingbufferIndex++;
+		if (upsamplerRingbufferIndex == COUNTOF_ARRAY(upsamplerRingbufferL))
+			upsamplerRingbufferIndex = 0;
 	}
 
 	delete[] input;
 	input = nullptr;
 
-	saveBuffer("downsampled.raw", downsampledBuffer, downsampledBufferLen);
+	saveBuffer("downsampled.raw", downsampledBuffer, downsampledBufferLenSamples);
 	delete[] downsampledBuffer;
 	downsampledBuffer = nullptr;
 
-	saveBuffer("reverb_out.raw", reverbOutputBuffer, reverbOutputBufferLen);
+	saveBuffer("reverb_out.raw", reverbOutputBuffer, reverbOutputBufferLenSamples);
 	delete[] reverbOutputBuffer;
 	reverbOutputBuffer = nullptr;
 
-	saveBuffer("upsampled.raw", upsampledBuffer, upsampledBufferLen);
+	saveBuffer("upsampled.raw", upsampledBuffer, upsampledBufferLenSamples);
 	delete[] upsampledBuffer;
 	upsampledBuffer = nullptr;
 
