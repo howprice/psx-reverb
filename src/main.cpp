@@ -1,5 +1,8 @@
 /*
 
+Digital Signal Processing
+=========================
+
 x[n] input signal
 y[n] output signal
 h[n] impulse response of the system
@@ -29,33 +32,39 @@ static void printUsage(const char* programName)
 	LOG_INFO("Usage: %s <filename>\n", programName);
 }
 
+// 39-tap PSX SPU FIR filter
+// https://psx-spx.consoledev.net/soundprocessingunitspu/#reverb-buffer-resampling
+// Each coefficient is a volume multipler N/0x8000, so after multiplying by the input sample, the result needs to be shift right by 15 to rescale.
+// Note that every other sample except the peak is zero, so this is effectively a 20-tap filter with zeros interleaved for downsampling by 2.
+// 
+// The filter is also used for upsampling!
+//
+static const s16 kFiniteImpulseResponse[] =
+{
+	-0x0001,  0x0000,  0x0002,  0x0000, -0x000A,  0x0000,  0x0023,  0000,
+	-0x0067,  0x0000,  0x010A,  0x0000, -0x0268,  0x0000,  0x0534,  0000,
+	-0x0B90,  0x0000,  0x2806,  0x4000,  0x2806,  0x0000, -0x0B90,  0000,
+	 0x0534,  0x0000, -0x0268,  0x0000,  0x010A,  0x0000, -0x0067,  0000,
+	 0x0023,  0x0000, -0x000A,  0x0000,  0x0002,  0x0000, -0x0001,
+};
+static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == 39);
+
 static bool downsample(
 	const s16* input, size_t inputLength,
 	s16* output, size_t outputCapacity, size_t& outputLength)
 {
-	// 39-tap PSX SPU FIR filter
-	// https://psx-spx.consoledev.net/soundprocessingunitspu/#reverb-buffer-resampling
-	// Each coefficient is a volume multipler N/0x8000, so after multiplying by the input sample, the result needs to be shift right by 15 to rescale.
-	// Note that every other sample except the peak is zero, so this is effectively a 20-tap filter with zeros interleaved for downsampling by 2.
-	static const s16 kImpulseResponse[] =
-	{
-		-0x0001,  0x0000,  0x0002,  0x0000, -0x000A,  0x0000,  0x0023,  0000,
-		-0x0067,  0x0000,  0x010A,  0x0000, -0x0268,  0x0000,  0x0534,  0000,
-		-0x0B90,  0x0000,  0x2806,  0x4000,  0x2806,  0x0000, -0x0B90,  0000,
-		 0x0534,  0x0000, -0x0268,  0x0000,  0x010A,  0x0000, -0x0067,  0000,
-		 0x0023,  0x0000, -0x000A,  0x0000,  0x0002,  0x0000, -0x0001,
-	};
-	static_assert(COUNTOF_ARRAY(kImpulseResponse) == 39);
-
 	outputLength = inputLength / 2; // Downsample by 2, so output length is half of input length
 	if (outputCapacity < outputLength)
+	{
+		LOG_ERROR("Output capacity is too small for downsampled output. Required: %zu samples, provided: %zu samples\n", outputLength, outputCapacity);
 		return false;
+	}
 
 	// Resample from 44100 to 22050 Hz by convolving with impulse response and downsampling by 2.
 	for (size_t i = 0; i < outputLength; i++)
 	{
 		s32 sum = 0;
-		for (size_t j = 0; j < COUNTOF_ARRAY(kImpulseResponse); j++)
+		for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
 		{
 			// Step input by 2 for downsampling.
 			// 
@@ -65,13 +74,113 @@ static bool downsample(
 			s64 inputIndex = (s64)(2 * i) - (s64)j;
 
 			s16 inputSample = (inputIndex >= 0 && inputIndex < (s64)inputLength) ? input[inputIndex] : 0;
-			sum += (s32)inputSample * (s32)kImpulseResponse[j];
+			sum += (s32)inputSample * (s32)kFiniteImpulseResponse[j];
 		}
 
 		sum >>= 15; // Rescale by 0x8000
 		output[i] = (s16)Clamp(sum, (s32)INT16_MIN, (s32)INT16_MAX); // Saturate to 16-bit signed range
 	}
 
+	return true;
+}
+
+static bool upsample(
+	const s16* input, size_t inputLength,
+	s16* output, size_t outputCapacity, size_t& outputLength)
+{
+	// Upsample 2x by "stuffing" every other element with zeros.
+	if (outputCapacity < inputLength * 2)
+	{
+		LOG_ERROR("Output capacity is too small for upsampled output. Required: %zu samples, provided: %zu samples\n", inputLength * 2, outputCapacity);
+		return false;
+	}
+
+	outputLength = inputLength * 2; // Upsample by 2, so output length is double the input length
+
+	// Resample from 22050 Hz to 44100 Hz by upsampling by 2 and convolving with impulse response.
+	for (size_t i = 0; i < outputLength; i++)
+	{
+		s32 sum = 0;
+		for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
+		{
+			s64 zeroStuffedIndex = (s64)i - (s64)j;
+
+			// Check if this position would have an actual sample (even index in zero-stuffed signal).
+			if (zeroStuffedIndex >= 0 && (zeroStuffedIndex & 1) == 0)
+			{
+				size_t inputIndex = (size_t)zeroStuffedIndex / 2; // Divide by 2 to get corresponding input index for zero-stuffed signal
+				HP_DEBUG_ASSERT(inputIndex < inputLength); // should never fail by construction
+				s16 inputSample = input[inputIndex];
+				sum += (s32)inputSample * (s32)kFiniteImpulseResponse[j];
+			}
+			// else zero-stuffed sample, so contributes nothing to the sum
+		}
+
+		// The coefficients in the FIR table represent volume multipler N/0x8000 so should rescale by dividing by 0x8000 (shifting right by 15) to compensate for this.
+		// However, because of the zero stuffing, everuy other sample in the input is zero, the volume will be halved compared to the downsampled signal,
+		// so instead of rescaling by 0x8000, we can rescale by 0x4000 (shifting right by 14)
+		sum >>= 14; 
+
+		output[i] = (s16)Clamp(sum, (s32)INT16_MIN, (s32)INT16_MAX); // Saturate to 16-bit signed range
+	}
+
+	return true;
+}
+
+static bool loadInput(const char* filename, s16*& buffer, size_t& numElements)
+{
+	FILE* file = fopen(filename, "rb");
+	if (!file)
+	{
+		LOG_ERROR("Failed to open file: %s\n", filename);
+		return false;
+	}
+	fseek(file, 0, SEEK_END);
+	long fileSize = ftell(file);
+
+	if ((fileSize % 2) != 0)
+	{
+		LOG_ERROR("Expect signed 16-bit input data. File size is not a multiple of 2 bytes: %s\n", filename);
+		fclose(file);
+		return false;
+	}
+
+	fseek(file, 0, SEEK_SET); // Seek back to beginning before reading
+	numElements = fileSize / 2; // Each sample is 2 bytes (16 bits)
+	buffer = new s16[numElements];
+	if (fread(buffer, 2, numElements, file) != numElements)
+	{
+		LOG_ERROR("Failed to read file: %s\n", filename);
+		fclose(file);
+		return false;
+	}
+
+	fclose(file);
+	file = nullptr;
+	LOG_INFO("Read %s size %zu samples\n", filename, numElements);
+	return true;
+}
+
+static bool saveBuffer(const char* filename, s16* buffer, size_t numElements)
+{
+	FILE* file = fopen(filename, "wb");
+	if (!file)
+	{
+		LOG_ERROR("Failed to open file for write: %s\n", filename);
+		return false;
+	}
+
+	if (fwrite(buffer, 2, numElements, file) != numElements)
+	{
+		LOG_ERROR("Failed to write to file: %s\n", filename);
+		fclose(file);
+		return false;
+	}
+
+	fclose(file);
+	file = nullptr;
+
+	LOG_INFO("Wrote buffer to file %s size %zu samples\n", buffer, numElements);
 	return true;
 }
 
@@ -84,76 +193,49 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 
-	const char* filename = argv[1];
-	FILE* inputFile = fopen(filename, "rb");
-	if (!inputFile)
+	const char* inputFilename = argv[1];
+	s16* input;
+	size_t inputLengthSamples; // Each sample is 2 bytes (16 bits)
+	if (!loadInput(inputFilename, /*out*/input, /*out*/inputLengthSamples))
 	{
-		LOG_ERROR("Failed to open file: %s\n", filename);
+		LOG_ERROR("Failed to load input file: %s\n", inputFilename);
 		return EXIT_FAILURE;
 	}
-
-	// Check file size matches expected memory card size
-	fseek(inputFile, 0, SEEK_END);
-	long fileSize = ftell(inputFile);
-	fseek(inputFile, 0, SEEK_SET); // Seek back to beginning before reading
-
-	if ((fileSize % 2) != 0)
-	{
-		LOG_ERROR("Expect signed 16-bit input data. File size is not a multiple of 2 bytes: %s\n", filename);
-		fclose(inputFile);
-		return EXIT_FAILURE;
-	}
-
-	size_t inputLength = fileSize / 2; // Each sample is 2 bytes (16 bits)
-
-	s16* input = new s16[inputLength];
-
-	if (fread(input, 2, inputLength, inputFile) != inputLength)
-	{
-		LOG_ERROR("Failed to read file: %s\n", filename);
-		fclose(inputFile);
-		return EXIT_FAILURE;
-	}
-	fclose(inputFile);
-	inputFile = nullptr;
 
 	// For full convolution, the length of the output signal is equal to the length of the input signal, plus the length of the impulse response, minus one.
 	// However we are downsampling by 2, so the output length is half of the input length. We can calculate the output capacity based on this.
-	size_t outputCapacity = inputLength / 2; // Downsample by 2, so output capacity is half of input length
-	s16* output = new s16[outputCapacity];
+	size_t downsampledBufferCapacity = inputLengthSamples / 2; // Downsample by 2, so output capacity is half of input length
+	s16* downsampledBuffer = new s16[downsampledBufferCapacity];
 
-	size_t outputLength;
-	if (!downsample(input, inputLength, output, outputCapacity, /*out*/outputLength))
+	size_t downsampledBufferLen;
+	if (!downsample(input, inputLengthSamples, downsampledBuffer, downsampledBufferCapacity, /*out*/downsampledBufferLen))
 	{
 		LOG_ERROR("Downsampling failed\n");
 		return EXIT_FAILURE;
 	}
 
-	// Save output
-	FILE* outputFile = fopen("output.bin", "wb");
-	if (!outputFile)
+	// Upsample back to 44100 Hz
+	size_t upsampledBufferCapacity = downsampledBufferLen * 2; // Upsample by 2, so output capacity is double the downsampled length
+	s16* upsampledBuffer = new s16[upsampledBufferCapacity]; // Upsample by 2, so output capacity is double the downsampled length
+	size_t upsampledBufferLen;
+	if (!upsample(downsampledBuffer, downsampledBufferLen, upsampledBuffer, upsampledBufferCapacity, /*out*/upsampledBufferLen))
 	{
-		LOG_ERROR("Failed to open output file for writing: output.bin\n");
+		LOG_ERROR("Upsampling failed\n");
 		return EXIT_FAILURE;
 	}
-
-	if (fwrite(output, 2, outputLength, outputFile) != outputLength)
-	{
-		LOG_ERROR("Failed to write output file: output.bin\n");
-		fclose(outputFile);
-		return EXIT_FAILURE;
-	}
-
-	LOG_INFO("Output written to output.bin\n");
-
-	fclose(outputFile);
-	outputFile = nullptr;
 
 	delete[] input;
 	input = nullptr;
 
-	delete[] output;
-	output = nullptr;
+	// Save downsampled output to file for inspection
+	saveBuffer("downsample.raw", downsampledBuffer, downsampledBufferLen);
+	delete[] downsampledBuffer;
+	downsampledBuffer = nullptr;
+
+	// Save upsampled output to file for inspection
+	saveBuffer("upsample.raw", upsampledBuffer, upsampledBufferLen);
+	delete[] upsampledBuffer;
+	upsampledBuffer = nullptr;
 
     return EXIT_SUCCESS;
 }
