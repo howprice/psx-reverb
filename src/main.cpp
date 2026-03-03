@@ -16,6 +16,13 @@ For full convolution, the length of the output signal is equal to the length of 
 
 FIR Finite Impulse Response
 
+TODO
+====
+- Implement reflection
+- Comb filters
+- All pass filters
+- Stereo
+
 */
 
 #include "Log.h"
@@ -49,7 +56,9 @@ static const s16 kFiniteImpulseResponse[] =
 };
 static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == 39);
 
-static bool downsample(
+// Processes a whole buffer
+[[maybe_unused]]
+static bool downsampleBuffer(
 	const s16* input, size_t inputLength,
 	s16* output, size_t outputCapacity, size_t& outputLength)
 {
@@ -84,7 +93,9 @@ static bool downsample(
 	return true;
 }
 
-static bool upsample(
+// Processes a whole buffer
+[[maybe_unused]]
+static bool upsampleBuffer(
 	const s16* input, size_t inputLength,
 	s16* output, size_t outputCapacity, size_t& outputLength)
 {
@@ -180,7 +191,7 @@ static bool saveBuffer(const char* filename, s16* buffer, size_t numElements)
 	fclose(file);
 	file = nullptr;
 
-	LOG_INFO("Wrote buffer to file %s size %zu samples\n", buffer, numElements);
+	LOG_INFO("Wrote %s size %zu samples\n", filename, numElements);
 	return true;
 }
 
@@ -202,38 +213,96 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 
+	// Create some intermediate buffers for debugging
+
 	// For full convolution, the length of the output signal is equal to the length of the input signal, plus the length of the impulse response, minus one.
 	// However we are downsampling by 2, so the output length is half of the input length. We can calculate the output capacity based on this.
-	size_t downsampledBufferCapacity = inputLengthSamples / 2; // Downsample by 2, so output capacity is half of input length
+	const size_t downsampledBufferCapacity = inputLengthSamples / 2; // Downsample by 2, so output capacity is half of input length
 	s16* downsampledBuffer = new s16[downsampledBufferCapacity];
+	size_t downsampledBufferLen = 0; // Will be set by downsample function
 
-	size_t downsampledBufferLen;
-	if (!downsample(input, inputLengthSamples, downsampledBuffer, downsampledBufferCapacity, /*out*/downsampledBufferLen))
-	{
-		LOG_ERROR("Downsampling failed\n");
-		return EXIT_FAILURE;
-	}
+	// Reverb is performed at 22050 Hz
+	const size_t reverbOutputBufferCapacitySamples = downsampledBufferCapacity;
+	s16* reverbOutputBuffer = new s16[reverbOutputBufferCapacitySamples];
+	size_t reverbOutputBufferLen = 0;
 
-	// Upsample back to 44100 Hz
-	size_t upsampledBufferCapacity = downsampledBufferLen * 2; // Upsample by 2, so output capacity is double the downsampled length
+	// Final output from reverb output upsampled back to 44100 Hz
+	const size_t upsampledBufferCapacity = inputLengthSamples; // Upsample by 2, so output capacity is double the downsampled length
 	s16* upsampledBuffer = new s16[upsampledBufferCapacity]; // Upsample by 2, so output capacity is double the downsampled length
-	size_t upsampledBufferLen;
-	if (!upsample(downsampledBuffer, downsampledBufferLen, upsampledBuffer, upsampledBufferCapacity, /*out*/upsampledBufferLen))
+	size_t upsampledBufferLen = 0;
+
+	// This would run at 44100 Hz
+	for (unsigned int inputSampleIndex = 0; inputSampleIndex < inputLengthSamples; inputSampleIndex++)
 	{
-		LOG_ERROR("Upsampling failed\n");
-		return EXIT_FAILURE;
+		// Reverb is processed every other cycle i.e. at 22050 Hz
+		if ((inputSampleIndex & 1) == 0)
+		{
+			// Downsample from 44100 Hz to 22050 Hz
+			{
+				s32 sum = 0;
+				for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
+				{
+					// n.b. The filter is not centered so introduced a delay. To center the filter input index would need to
+					// be offset by 19 (half of 39) but this would cause negative input index for the first 19 output samples,
+					// so we start with input index of 0 and let the filter introduce the delay.
+					s64 inputIndex = (s64)inputSampleIndex - (s64)j;
+
+					s16 inputSample = inputIndex >= 0 ? input[inputIndex] : 0;
+					sum += (s32)inputSample * (s32)kFiniteImpulseResponse[j];
+				}
+
+				sum >>= 15; // Rescale by 0x8000
+
+				HP_DEBUG_ASSERT(downsampledBufferLen < downsampledBufferCapacity); // should never fail by construction
+				downsampledBuffer[downsampledBufferLen++] = (s16)Clamp(sum, (s32)INT16_MIN, (s32)INT16_MAX); // Saturate to 16-bit signed range
+			}
+
+			// #TEMP: Just copy the downsampled buffer into the reverb output buffer for now, will implement actual reverb processing later.
+			HP_DEBUG_ASSERT(reverbOutputBufferLen < reverbOutputBufferCapacitySamples); // should never fail by construction
+			reverbOutputBuffer[reverbOutputBufferLen] = downsampledBuffer[reverbOutputBufferLen];
+			reverbOutputBufferLen++;
+		}
+
+		// Upsample from 22050 Hz back to 44100 Hz
+		// In the PSX SPU reverb unit, this is achieved with "zero stuffing" every other element and convolving with the same FIR filter.
+		{
+			s32 sum = 0;
+			for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
+			{
+				s64 zeroStuffedIndex = (s64)inputSampleIndex - (s64)j;
+
+				// Check if this position would have an actual sample (even index in zero-stuffed signal).
+				if (zeroStuffedIndex >= 0 && (zeroStuffedIndex & 1) == 0)
+				{
+					size_t reverbBufferIndex = (size_t)zeroStuffedIndex >> 1; // Divide by 2 to get corresponding input index for zero-stuffed signal
+					HP_DEBUG_ASSERT(reverbBufferIndex < reverbOutputBufferLen);
+					sum += (s32)reverbOutputBuffer[reverbBufferIndex] * (s32)kFiniteImpulseResponse[j];
+				}
+				// else zero-stuffed sample, so contributes nothing to the sum
+			}
+
+			// The coefficients in the FIR table represent volume multipler N/0x8000 so should rescale by dividing by 0x8000 (shifting right by 15) to compensate for this.
+			// However, because of the zero stuffing, everuy other sample in the input is zero, the volume will be halved compared to the downsampled signal,
+			// so instead of rescaling by 0x8000, we can rescale by 0x4000 (shifting right by 14)
+			sum >>= 14;
+
+			HP_DEBUG_ASSERT(upsampledBufferLen < upsampledBufferCapacity); // should never fail by construction
+			upsampledBuffer[upsampledBufferLen++] = (s16)Clamp(sum, (s32)INT16_MIN, (s32)INT16_MAX); // Saturate to 16-bit signed range
+		}
 	}
 
 	delete[] input;
 	input = nullptr;
 
-	// Save downsampled output to file for inspection
-	saveBuffer("downsample.raw", downsampledBuffer, downsampledBufferLen);
+	saveBuffer("downsampled.raw", downsampledBuffer, downsampledBufferLen);
 	delete[] downsampledBuffer;
 	downsampledBuffer = nullptr;
 
-	// Save upsampled output to file for inspection
-	saveBuffer("upsample.raw", upsampledBuffer, upsampledBufferLen);
+	saveBuffer("reverb_out.raw", reverbOutputBuffer, reverbOutputBufferLen);
+	delete[] reverbOutputBuffer;
+	reverbOutputBuffer = nullptr;
+
+	saveBuffer("upsampled.raw", upsampledBuffer, upsampledBufferLen);
 	delete[] upsampledBuffer;
 	upsampledBuffer = nullptr;
 
