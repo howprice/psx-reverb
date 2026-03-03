@@ -30,6 +30,12 @@ target_sources(${DSP_TARGET} PRIVATE ${SRC_LIST} )
 # Require C++17 to support terse static_assert
 target_compile_features(${DSP_TARGET} PRIVATE cxx_std_17)
 
+# Define DEBUG in debug builds
+target_compile_definitions(${DSP_TARGET} PRIVATE $<$<CONFIG:Debug>:DEBUG>)
+
+# Define RELEASE in debug builds
+target_compile_definitions(${DSP_TARGET} PRIVATE $<$<CONFIG:Release>:RELEASE>)
+
 set_property(TARGET ${DSP_TARGET} PROPERTY COMPILE_WARNING_AS_ERROR ON)
 
 # Compiler-specific options
