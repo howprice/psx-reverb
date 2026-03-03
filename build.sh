@@ -8,7 +8,7 @@ SOURCE=${BASH_SOURCE[0]}
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 #echo "SOURCE is '$SOURCE'"
 #echo "SCRIPT_DIR is '$SCRIPT_DIR"
-pushd $SCRIPT_DIR/.. > /dev/null
+pushd $SCRIPT_DIR > /dev/null
 
 echo "Building GCC Debug"
 cmake -S . -B build/gcc/debug -GNinja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++
