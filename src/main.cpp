@@ -668,18 +668,27 @@ int main(int argc, char** argv)
 			// Reverb chain
 			
 			// Same Side Reflection (left-to-left and right-to-right)
-			// [mLSAME] = (Lin + [dLSAME]*vWALL - [mLSAME-2])*vIIR + [mLSAME-2]  ;L-to-L
-			// [mRSAME] = (Rin + [dRSAME]*vWALL - [mRSAME-2])*vIIR + [mRSAME-2]  ;R-to-R
+			//   [mLSAME] = (Lin + [dLSAME]*vWALL - [mLSAME-2])*vIIR + [mLSAME-2]  ;L-to-L
+			//   [mRSAME] = (Rin + [dRSAME]*vWALL - [mRSAME-2])*vIIR + [mRSAME-2]  ;R-to-R
 			s32 LSAME = applyReflection(spu, Lin, reverb.mLSAME, reverb.dLSAME, reverb.vIIR, reverb.vWALL);
 			s32 RSAME = applyReflection(spu, Rin, reverb.mRSAME, reverb.dRSAME, reverb.vIIR, reverb.vWALL);
 
-			// #TODO: Different Side Reflection (left-to-right and right-to-left)
+			// The outputs aren't used directly. They are written to memory and read by the subsequent comb filters.
+			HP_UNUSED(LSAME);
+			HP_UNUSED(RSAME);
+
+			// Different Side Reflection (left-to-right and right-to-left)
+			//   [mLDIFF] = (Lin + [dRDIFF]*vWALL - [mLDIFF-2])*vIIR + [mLDIFF-2]  ;R-to-L   n.b. This uses the *right* delay tap dRDIFF to bounce the signal from left to right
+			//   [mRDIFF] = (Rin + [dLDIFF]*vWALL - [mRDIFF-2])*vIIR + [mRDIFF-2]  ;L-to-R   n.b. This uses the *left* delay tap dLDIFF to bounce the signal from right to left
+			s32 LDIFF = applyReflection(spu, Lin, reverb.mLDIFF, reverb.dRDIFF, reverb.vIIR, reverb.vWALL);
+			s32 RDIFF = applyReflection(spu, Rin, reverb.mRDIFF, reverb.dLDIFF, reverb.vIIR, reverb.vWALL);
+
 			// #TODO: Early Echo (Comb Filter, with input from buffer)
 			// #TODO: Late Reverb APF1 (All Pass Filter 1, with input from COMB)
 			// #TODO: Late Reverb APF2 (All Pass Filter 2, with input from APF1)
-			// #TEMP: Just copy the Same Side Reflection output into output
-			s32 Lout = LSAME;
-			s32 Rout = RSAME;
+			// #TEMP: Just copy the Reflection output into output
+			s32 Lout = LDIFF;
+			s32 Rout = RDIFF;
 
 			// Apply output volume vLOUT, vROUT
 			s32 LeftOutput = (Lout * (s32)spu.vLOUT) >> 15; // / 0x8000;
