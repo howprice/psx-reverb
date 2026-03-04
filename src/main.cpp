@@ -620,23 +620,24 @@ int main(int argc, char** argv)
 	const ReverbRegisters& reverb = kReverbPresets[(int)preset];
 	LOG_INFO("Reverb preset: %s\n", kReverbPresetNames[(int)preset]);
 
+	SPU* pSpu = new SPU(); // heap allocate large structure
+
 	// All of the reverb presets seem to use 0x8000 for vLIN and vRIN.
 	// This is maximum negative volume and will invert the signal.
 	// So perform the same operation at the output to flip the signal back up again.
-	SPU spu{};
-	spu.vLOUT = INT16_MIN;
-	spu.vROUT = INT16_MIN;
-	spu.mBASE = (u16)(0x60000 >> 3); // Representative value for testing
+	pSpu->vLOUT = INT16_MIN;
+	pSpu->vROUT = INT16_MIN;
+	pSpu->mBASE = (u16)(0x60000 >> 3); // Representative value for testing
 
-	spu.reverbBufferStart = spu.mBASE * 8; // Convert from address in sound ram (divided by 8) to byte address
+	pSpu->reverbBufferStart = pSpu->mBASE * 8; // Convert from address in sound ram (divided by 8) to byte address
 
 	// Writing to mBASE set the current buffer address to that value.
-	spu.currentReverbBufferHead = spu.reverbBufferStart;
+	pSpu->currentReverbBufferHead = pSpu->reverbBufferStart;
 
 	// Calculate the reverb buffer size, which is required for accessing reverb buffer memory
-	HP_ASSERT(spu.currentReverbBufferHead <= SPU::kRamSizeBytes);
-	spu.reverbBufferSizeBytes = SPU::kRamSizeBytes - spu.currentReverbBufferHead;
-	HP_ASSERT(spu.reverbBufferSizeBytes >= kReverbPresetBufferSizeBytes[(int)preset]); // Reverb buffer size must fit in available ram
+	HP_ASSERT(pSpu->currentReverbBufferHead <= SPU::kRamSizeBytes);
+	pSpu->reverbBufferSizeBytes = SPU::kRamSizeBytes - pSpu->currentReverbBufferHead;
+	HP_ASSERT(pSpu->reverbBufferSizeBytes >= kReverbPresetBufferSizeBytes[(int)preset]); // Reverb buffer size must fit in available ram
 
 	s16 downsamplerRingbufferL[kFIRFilterSize]{};
 	s16 downsamplerRingbufferR[kFIRFilterSize]{};
@@ -730,8 +731,8 @@ int main(int argc, char** argv)
 			// Same Side Reflection (left-to-left and right-to-right)
 			//   [mLSAME] = (Lin + [dLSAME]*vWALL - [mLSAME-2])*vIIR + [mLSAME-2]  ;L-to-L
 			//   [mRSAME] = (Rin + [dRSAME]*vWALL - [mRSAME-2])*vIIR + [mRSAME-2]  ;R-to-R
-			s32 LSAME = applyReflection(spu, Lin, reverb.mLSAME, reverb.dLSAME, reverb.vIIR, reverb.vWALL);
-			s32 RSAME = applyReflection(spu, Rin, reverb.mRSAME, reverb.dRSAME, reverb.vIIR, reverb.vWALL);
+			s32 LSAME = applyReflection(*pSpu, Lin, reverb.mLSAME, reverb.dLSAME, reverb.vIIR, reverb.vWALL);
+			s32 RSAME = applyReflection(*pSpu, Rin, reverb.mRSAME, reverb.dRSAME, reverb.vIIR, reverb.vWALL);
 			HP_DEBUG_ASSERT(sameSideReflectionBufferLenSamples + 2 <= sameSideReflectionBufferCapacitySamples); // should never fail by construction
 			// The outputs aren't used directly. They are written to memory and read by the subsequent comb filters.
 			sameSideReflectionBuffer[sameSideReflectionBufferLenSamples++] = saturateS32toS16(LSAME);
@@ -740,8 +741,8 @@ int main(int argc, char** argv)
 			// Different Side Reflection (left-to-right and right-to-left)
 			//   [mLDIFF] = (Lin + [dRDIFF]*vWALL - [mLDIFF-2])*vIIR + [mLDIFF-2]  ;R-to-L   n.b. This uses the *right* delay tap dRDIFF to bounce the signal from left to right
 			//   [mRDIFF] = (Rin + [dLDIFF]*vWALL - [mRDIFF-2])*vIIR + [mRDIFF-2]  ;L-to-R   n.b. This uses the *left* delay tap dLDIFF to bounce the signal from right to left
-			s32 LDIFF = applyReflection(spu, Lin, reverb.mLDIFF, reverb.dRDIFF, reverb.vIIR, reverb.vWALL);
-			s32 RDIFF = applyReflection(spu, Rin, reverb.mRDIFF, reverb.dLDIFF, reverb.vIIR, reverb.vWALL);
+			s32 LDIFF = applyReflection(*pSpu, Lin, reverb.mLDIFF, reverb.dRDIFF, reverb.vIIR, reverb.vWALL);
+			s32 RDIFF = applyReflection(*pSpu, Rin, reverb.mRDIFF, reverb.dLDIFF, reverb.vIIR, reverb.vWALL);
 			// The outputs aren't used directly. They are written to memory and read by the subsequent comb filters.
 			HP_DEBUG_ASSERT(differentSideReflectionBufferLenSamples + 2 <= differentSideReflectionBufferCapacitySamples); // should never fail by construction
 			differentSideReflectionBuffer[differentSideReflectionBufferLenSamples++] = saturateS32toS16(LDIFF);
@@ -750,8 +751,8 @@ int main(int argc, char** argv)
 			// Early Echo (Comb Filter, with input from buffer)
 			//   Lout=vCOMB1*[mLCOMB1]+vCOMB2*[mLCOMB2]+vCOMB3*[mLCOMB3]+vCOMB4*[mLCOMB4]
 			//   Rout=vCOMB1*[mRCOMB1]+vCOMB2*[mRCOMB2]+vCOMB3*[mRCOMB3]+vCOMB4*[mRCOMB4]
-			s32 Lout = applyEarlyEcho(spu, reverb.mLCOMB1, reverb.mLCOMB2, reverb.mLCOMB3, reverb.mLCOMB4, reverb.vCOMB1, reverb.vCOMB2, reverb.vCOMB3, reverb.vCOMB4);
-			s32 Rout = applyEarlyEcho(spu, reverb.mRCOMB1, reverb.mRCOMB2, reverb.mRCOMB3, reverb.mRCOMB4, reverb.vCOMB1, reverb.vCOMB2, reverb.vCOMB3, reverb.vCOMB4);
+			s32 Lout = applyEarlyEcho(*pSpu, reverb.mLCOMB1, reverb.mLCOMB2, reverb.mLCOMB3, reverb.mLCOMB4, reverb.vCOMB1, reverb.vCOMB2, reverb.vCOMB3, reverb.vCOMB4);
+			s32 Rout = applyEarlyEcho(*pSpu, reverb.mRCOMB1, reverb.mRCOMB2, reverb.mRCOMB3, reverb.mRCOMB4, reverb.vCOMB1, reverb.vCOMB2, reverb.vCOMB3, reverb.vCOMB4);
 			HP_DEBUG_ASSERT(earlyEchoBufferLenSamples + 2 <= earlyEchoBufferCapacitySamples); // should never fail by construction
 			earlyEchoBuffer[earlyEchoBufferLenSamples++] = saturateS32toS16(Lout);
 			earlyEchoBuffer[earlyEchoBufferLenSamples++] = saturateS32toS16(Rout);
@@ -760,8 +761,8 @@ int main(int argc, char** argv)
 			// #TODO: Late Reverb APF2 (All Pass Filter 2, with input from APF1)
 
 			// Apply output volume vLOUT, vROUT
-			s32 LeftOutput = (Lout * (s32)spu.vLOUT) >> 15; // / 0x8000;
-			s32 RightOutput = (Rout * (s32)spu.vROUT) >> 15; // / 0x8000;
+			s32 LeftOutput = (Lout * (s32)pSpu->vLOUT) >> 15; // / 0x8000;
+			s32 RightOutput = (Rout * (s32)pSpu->vROUT) >> 15; // / 0x8000;
 
 			// Write the new reverb output values into the upsampler ring buffers
 			upsamplerRingbufferL[upsamplerRingbufferIndex] = saturateS32toS16(LeftOutput);
@@ -774,9 +775,9 @@ int main(int argc, char** argv)
 
 			// Increment and wrap reverb buffer current head position.
 			// Note that each reverb stage has separate buffers for L and R so only need to advance by 1 sample (2 bytes) per cycle, not 2 samples for stereo.
-			spu.currentReverbBufferHead += 2;
-			if (spu.currentReverbBufferHead >= SPU::kRamSizeBytes)
-				spu.currentReverbBufferHead -= spu.reverbBufferSizeBytes;
+			pSpu->currentReverbBufferHead += 2;
+			if (pSpu->currentReverbBufferHead >= SPU::kRamSizeBytes)
+				pSpu->currentReverbBufferHead -= pSpu->reverbBufferSizeBytes;
 		}
 		else
 		{
@@ -829,6 +830,9 @@ int main(int argc, char** argv)
 		if (upsamplerRingbufferIndex == COUNTOF_ARRAY(upsamplerRingbufferL))
 			upsamplerRingbufferIndex = 0;
 	}
+
+	delete pSpu;
+	pSpu = nullptr;
 
 	delete[] input;
 	input = nullptr;
