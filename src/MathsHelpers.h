@@ -71,31 +71,3 @@ inline constexpr T Lerp(T& a, T& b, float t)
 {
 	return (T)(a + (b - a) * t);
 }
-
-inline constexpr float Floor(float t)
-{
-	return (float)(int)t;
-}
-
-inline constexpr float Frac(float t)
-{
-	return t - Floor(t);
-}
-
-inline constexpr s32 SignExtend11BitTo32Bit(u32 value)
-{
-#if 0
-	if (value & 0x400) // Check sign bit (bit 10)
-	{
-		return (s32)(value | 0xfffff800); // Extend sign bit
-	}
-	else
-	{
-		return (s32)(value & 0x7ff); // Positive value
-	}
-#else
-	// Shift left to move bit 10 to bit 31 (sign bit position)
-	// Then arithmetic shift right to sign-extend
-	return (s32)(value << 21) >> 21;
-#endif
-}
