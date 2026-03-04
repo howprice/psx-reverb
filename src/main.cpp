@@ -24,7 +24,6 @@ i.e. IIR filters use feedback.
 
 TODO
 ====
-- All pass filters
 - Add or identify BIOS reverb preset
 - vIIR -8000h bug https://psx-spx.consoledev.net/soundprocessingunitspu/#bug
 */
@@ -354,7 +353,7 @@ static bool loadInput(const char* filename, s16*& buffer, size_t& numElements)
 
 	fclose(file);
 	file = nullptr;
-	LOG_INFO("Read %s size %zu samples\n", filename, numElements);
+	LOG_INFO("Read \"%s\" size %zu samples\n", filename, numElements);
 	return true;
 }
 
@@ -377,7 +376,7 @@ static bool saveBuffer(const char* filename, s16* buffer, size_t numElements)
 	fclose(file);
 	file = nullptr;
 
-	LOG_INFO("Wrote %s size %zu samples\n", filename, numElements);
+	LOG_INFO("Wrote \"%s\" size %zu samples\n", filename, numElements);
 	return true;
 }
 
@@ -421,6 +420,10 @@ static void writeReverbBuffer(SPU& spu, u16 addressDiv8, s16 val)
 static s16 readRAM(const SPU& spu, u32 address)
 {
 	HP_ASSERT(address + 2 <= SPU::kRamSizeBytes);
+
+	// For the purposes of this application, we only expect to read from the referby buffer.
+	HP_ASSERT(address >= spu.reverbBufferStart && address + 2 <= SPU::kRamSizeBytes);
+
 	s16 val = *(s16*)(spu.ram + address);
 	return val;
 }
@@ -428,6 +431,10 @@ static s16 readRAM(const SPU& spu, u32 address)
 static void writeRAM(SPU& spu, u32 address, s16 val)
 {
 	HP_ASSERT(address + 2 <= SPU::kRamSizeBytes);
+
+	// For the purposes of this application, we only expect to read from the referby buffer.
+	HP_ASSERT(address >= spu.reverbBufferStart && address + 2 <= SPU::kRamSizeBytes);
+
 	u16* pDst = (u16*)(spu.ram + address);
 	*pDst = val;
 }
@@ -498,7 +505,7 @@ static s32 applyReflection(
 // The delay time determines the spacing of the peaks and troughs, and the feedback volume determines how pronounced they are.
 // The peaks and troughs are generated due to constructive and destructive interference between the direct sound and the delayed sound.
 //
-// out=vCOMB1*[mCOMB1] + vCOMB2*[mCOMB2] + vCOMB3*[mCOMB3] + vCOMB4*[mCOMB4]
+//   out=vCOMB1*[mCOMB1] + vCOMB2*[mCOMB2] + vCOMB3*[mCOMB3] + vCOMB4*[mCOMB4]
 //
 static s32 applyEarlyEcho(
 	const SPU& spu,
@@ -511,6 +518,48 @@ static s32 applyEarlyEcho(
 	output += (s32)vComb3 * (s32)readReverbBuffer(spu, mComb3);
 	output += (s32)vComb4 * (s32)readReverbBuffer(spu, mComb4);
 	output >>= 15; // Rescale back down after multiplying by volume
+
+	return output;
+}
+
+// Late Reverb All Pass Filter, with input from COMB
+//
+// Passes all frequencies with equal magnitude (hence "all-pass")
+// Introduces frequency-dependent phase shifts
+// Creates diffusion - smearing out echoes into a dense reverb tail
+// Makes discrete echoes from comb filters sound more natural
+// 
+//   out = in - (vAPF * buf[m_addr-d_addr])
+//   buf[m_addr]=out
+//   out = (out * vAPF) + buf[m_addr-d_addr]
+//
+static s32 applyLateReverb(
+	SPU& spu,
+	s32 input,
+	u16 m_addr,
+	u16 d_addr, // displacement relative to m_addr. It represents the buffer size i.e. delay time of the late reverb
+	s16 vAPF)
+{
+	u32 addr = reverbAddrToRamAddr(spu, m_addr);
+
+	// Calculate the address of the delayed sample that we will read and write for the APF
+	u32 disp = d_addr * 8u; // Convert from address in sound ram (divided by 8) to byte offset.
+	s64 delayedSampleAddrSigned = (s64)addr - (s64)disp; // handle potential wrap-around by using signed arithmetic first
+	if (delayedSampleAddrSigned < spu.reverbBufferStart)
+		delayedSampleAddrSigned += spu.reverbBufferSizeBytes; // the reverb buffer always extends to the end of RAM, so wrap around to there
+	u32 delayedSampleAddr = (u32)delayedSampleAddrSigned;
+	HP_ASSERT(delayedSampleAddr >= spu.reverbBufferStart && delayedSampleAddr + 2 <= SPU::kRamSizeBytes);
+
+	// out = in - (vAPF * buf[m_addr-d_addr])
+	s16 delayedSample = readRAM(spu, delayedSampleAddr);
+	s32 output = input - ((vAPF * delayedSample) >> 15); // Apply volume, and rescale back down to signed 16-bit range
+
+	// buf[m_addr] = out
+	writeRAM(spu, addr, saturateS32toS16(output));
+
+	// out = (out * vAPF) + buf[m_addr-d_addr]
+	output = (output * vAPF) >> 15; // Rescale back down after multiplying by volume
+	output += (s32)delayedSample;
 
 	return output;
 }
@@ -663,9 +712,17 @@ int main(int argc, char** argv)
 	s16* differentSideReflectionBuffer = new s16[differentSideReflectionBufferCapacitySamples]; // single buffer containing stereo samplees
 	size_t differentSideReflectionBufferLenSamples = 0;
 
+	// Comb filter
 	const size_t earlyEchoBufferCapacitySamples = downsampledBufferCapacitySamples;
 	s16* earlyEchoBuffer = new s16[earlyEchoBufferCapacitySamples]; // single buffer containing stereo samplees
 	size_t earlyEchoBufferLenSamples = 0;
+
+	// APF1/APF2
+	const size_t lateReverbBufferCapacitySamples = downsampledBufferCapacitySamples; // Reverb is performed at 22050 Hz
+	s16* lateReverb1Buffer = new s16[lateReverbBufferCapacitySamples]; // single buffer containing stereo samplees
+	size_t lateReverb1BufferLenSamples = 0;
+	s16* lateReverb2Buffer = new s16[lateReverbBufferCapacitySamples]; // single buffer containing stereo samplees
+	size_t lateReverb2BufferLenSamples = 0;
 
 	const size_t reverbOutputBufferCapacitySamples = downsampledBufferCapacitySamples; // Reverb is performed at 22050 Hz
 	s16* reverbOutputBuffer = new s16[reverbOutputBufferCapacitySamples];
@@ -757,8 +814,23 @@ int main(int argc, char** argv)
 			earlyEchoBuffer[earlyEchoBufferLenSamples++] = saturateS32toS16(Lout);
 			earlyEchoBuffer[earlyEchoBufferLenSamples++] = saturateS32toS16(Rout);
 
-			// #TODO: Late Reverb APF1 (All Pass Filter 1, with input from COMB)
-			// #TODO: Late Reverb APF2 (All Pass Filter 2, with input from APF1)
+			// Late Reverb APF1 (All Pass Filter 1, with input from COMB)
+			//   Lout=Lout-vAPF1*[mLAPF1-dAPF1], [mLAPF1]=Lout, Lout=Lout*vAPF1+[mLAPF1-dAPF1]
+			//   Rout=Rout-vAPF1*[mRAPF1-dAPF1], [mRAPF1]=Rout, Rout=Rout*vAPF1+[mRAPF1-dAPF1]
+			Lout = applyLateReverb(*pSpu, Lout, reverb.mLAPF1, reverb.dAPF1, reverb.vAPF1);
+			Rout = applyLateReverb(*pSpu, Rout, reverb.mRAPF1, reverb.dAPF1, reverb.vAPF1);
+			HP_DEBUG_ASSERT(lateReverb1BufferLenSamples + 2 <= lateReverbBufferCapacitySamples); // should never fail by construction
+			lateReverb1Buffer[lateReverb1BufferLenSamples++] = saturateS32toS16(Lout);
+			lateReverb1Buffer[lateReverb1BufferLenSamples++] = saturateS32toS16(Rout);
+
+			// Late Reverb APF2 (All Pass Filter 2, with input from APF1)
+			//   Lout=Lout-vAPF2*[mLAPF2-dAPF2], [mLAPF2]=Lout, Lout=Lout*vAPF2+[mLAPF2-dAPF2]
+			//   Rout=Rout-vAPF2*[mRAPF2-dAPF2], [mRAPF2]=Rout, Rout=Rout*vAPF2+[mRAPF2-dAPF2]
+			Lout = applyLateReverb(*pSpu, Lout, reverb.mLAPF2, reverb.dAPF2, reverb.vAPF2);
+			Rout = applyLateReverb(*pSpu, Rout, reverb.mRAPF2, reverb.dAPF2, reverb.vAPF2);
+			HP_DEBUG_ASSERT(lateReverb2BufferLenSamples + 2 <= lateReverbBufferCapacitySamples); // should never fail by construction
+			lateReverb2Buffer[lateReverb2BufferLenSamples++] = saturateS32toS16(Lout);
+			lateReverb2Buffer[lateReverb2BufferLenSamples++] = saturateS32toS16(Rout);
 
 			// Apply output volume vLOUT, vROUT
 			s32 LeftOutput = (Lout * (s32)pSpu->vLOUT) >> 15; // / 0x8000;
@@ -837,31 +909,39 @@ int main(int argc, char** argv)
 	delete[] input;
 	input = nullptr;
 
-	saveBuffer("downsampled.raw", downsampledBuffer, downsampledBufferLenSamples);
+	saveBuffer("01-downsampled.raw", downsampledBuffer, downsampledBufferLenSamples);
 	delete[] downsampledBuffer;
 	downsampledBuffer = nullptr;
 
-	saveBuffer("same_side_reflection.raw", sameSideReflectionBuffer, sameSideReflectionBufferLenSamples);
+	saveBuffer("02-same_side_reflection.raw", sameSideReflectionBuffer, sameSideReflectionBufferLenSamples);
 	delete[] sameSideReflectionBuffer;
 	sameSideReflectionBuffer = nullptr;
 
-	saveBuffer("different_side_reflection.raw", differentSideReflectionBuffer, differentSideReflectionBufferLenSamples);
+	saveBuffer("03-different_side_reflection.raw", differentSideReflectionBuffer, differentSideReflectionBufferLenSamples);
 	delete[] differentSideReflectionBuffer;
 	differentSideReflectionBuffer = nullptr;
 
-	saveBuffer("early_echo.raw", earlyEchoBuffer, earlyEchoBufferLenSamples);
+	saveBuffer("04-early_echo.raw", earlyEchoBuffer, earlyEchoBufferLenSamples);
 	delete[] earlyEchoBuffer;
 	earlyEchoBuffer = nullptr;
 
-	saveBuffer("reverb_out.raw", reverbOutputBuffer, reverbOutputBufferLenSamples);
+	saveBuffer("05-late_reverb1.raw", lateReverb1Buffer, lateReverb1BufferLenSamples);
+	delete[] lateReverb1Buffer;
+	lateReverb1Buffer = nullptr;
+
+	saveBuffer("06-late_reverb2.raw", lateReverb2Buffer, lateReverb2BufferLenSamples);
+	delete[] lateReverb2Buffer;
+	lateReverb2Buffer = nullptr;
+
+	saveBuffer("07-reverb_out.raw", reverbOutputBuffer, reverbOutputBufferLenSamples);
 	delete[] reverbOutputBuffer;
 	reverbOutputBuffer = nullptr;
 
-	saveBuffer("upsampled.raw", upsampledBuffer, upsampledBufferLenSamples);
+	saveBuffer("08-upsampled-reverb-out.raw", upsampledBuffer, upsampledBufferLenSamples);
 	delete[] upsampledBuffer;
 	upsampledBuffer = nullptr;
 
-	saveBuffer("mixed_output.raw", mixedOutputBuffer, mixedOutputBufferLenSamples);
+	saveBuffer("09-mixed_output.raw", mixedOutputBuffer, mixedOutputBufferLenSamples);
 	delete[] mixedOutputBuffer;
 	mixedOutputBuffer = nullptr;
 
