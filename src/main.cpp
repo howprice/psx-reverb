@@ -19,25 +19,23 @@ FIR Finite Impulse Response
 TODO
 ====
 - Reflection filters
+- Add or identify BIOS reverb preset
 - Comb filters
 - All pass filters
 - Save mixed (dry + wet) output
-
 */
 
+#include "Parse.h"
 #include "Log.h"
 #include "hp_assert.h"
+#include "StringHelpers.h"
 #include "MathsHelpers.h"
 #include "ArrayHelpers.h"
 #include "Helpers.h" // HP_UNUSED
 #include "Types.h"
 
 #include <stdlib.h> // EXIT_SUCCESS, EXIT_FAILURE
-
-static void printUsage(const char* programName)
-{
-	LOG_INFO("Usage: %s <filename>\n", programName);
-}
+#include <string.h> // strcmp
 
 // 39-tap PSX SPU FIR filter
 // https://psx-spx.consoledev.net/soundprocessingunitspu/#reverb-buffer-resampling
@@ -97,6 +95,9 @@ static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == kFIRFilterSize);
 //   1F801DFEh rev1F vRIN    volume  Reverb Input Volume Right
 //
 // All volume registers are signed 16bit (range -8000h..+7FFFh).
+// - INT16_MAX 0x7fff is max volume
+// - INT16_MIN 0x8000 -32768 is max negative volume and will invert the signal
+// 
 // All src/dst/disp/base registers are addresses in SPU memory (divided by 8)
 // src/dst are relative to the current buffer address
 // disp registers are relative to src registers
@@ -105,14 +106,17 @@ static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == kFIRFilterSize);
 // 
 // https://psx-spx.consoledev.net/soundprocessingunitspu/#spu-reverb-registers
 //
-struct ReverbRegisters
+
+struct SpuRegisters
 {
-	// SPU registers
 	s16 vLOUT;
 	s16 vROUT;
 	u16 mBASE;
+};
 
-	// Reverb unit registers
+// Reverb unit registers
+struct ReverbRegisters
+{
 	u16 dAPF1;
 	u16 dAPF2;
 	u16 vIIR;
@@ -143,9 +147,156 @@ struct ReverbRegisters
 	u16 mRAPF1;
 	u16 mLAPF2;
 	u16 mRAPF2;
-	s16 vLIN;
-	s16 vRIN;
+	u16 vLIN;
+	u16 vRIN;
 };
+
+// Reverb presets from https://psx-spx.consoledev.net/soundprocessingunitspu/#spu-reverb-examples
+
+//   dAPF1  dAPF2  vIIR   vCOMB1 vCOMB2  vCOMB3  vCOMB4  vWALL   ;1F801DC0h..CEh
+//   vAPF1  vAPF2  mLSAME mRSAME mLCOMB1 mRCOMB1 mLCOMB2 mRCOMB2 ;1F801DD0h..DEh
+//   dLSAME dRSAME mLDIFF mRDIFF mLCOMB3 mRCOMB3 mLCOMB4 mRCOMB4 ;1F801DE0h..EEh
+//   dLDIFF dRDIFF mLAPF1 mRAPF1 mLAPF2  mRAPF2  vLIN    vRIN    ;1F801DF0h..FEh
+
+// Required memory size = 0x80000 - mBASE*8
+
+enum class ReverbPreset
+{
+	Room,
+	StudioSmall,
+	StudioMedium,
+	StudioLarge,
+	Hall,
+	HalfEcho,
+	SpaceEcho,
+	ChaosEcho,
+	Delay,
+	Off,
+
+	Max = Off
+};
+
+static const char* kReverbPresetNames[] =
+{
+	"Room",
+	"StudioSmal",
+	"StudioMedium",
+	"StudioLarge",
+	"Hall",
+	"HalfEcho",
+	"SpaceEcho",
+	"ChaosEcho",
+	"Delay",
+	"Off",
+};
+static_assert(COUNTOF_ARRAY(kReverbPresetNames) == ENUM_COUNT(ReverbPreset));
+
+// Room (size=26C0h bytes)
+static const ReverbRegisters kReverbPreset_Room =
+{
+	0x007D, 0x005B, 0x6D80, 0x54B8, 0xBED0, 0x0000, 0x0000, 0xBA80,
+	0x5800, 0x5300, 0x04D6, 0x0333, 0x03F0, 0x0227, 0x0374, 0x01EF,
+	0x0334, 0x01B5, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+	0x0000, 0x0000, 0x01B4, 0x0136, 0x00B8, 0x005C, 0x8000, 0x8000,
+};
+
+// Studio Small (size=1F40h bytes)
+static const ReverbRegisters kReverbPreset_StudioSmall =
+{
+	0x0033, 0x0025, 0x70F0, 0x4FA8, 0xBCE0, 0x4410, 0xC0F0, 0x9C00,
+	0x5280, 0x4EC0, 0x03E4, 0x031B, 0x03A4, 0x02AF, 0x0372, 0x0266,
+	0x031C, 0x025D, 0x025C, 0x018E, 0x022F, 0x0135, 0x01D2, 0x00B7,
+	0x018F, 0x00B5, 0x00B4, 0x0080, 0x004C, 0x0026, 0x8000, 0x8000,
+};
+
+// Studio Medium (size=4840h bytes)
+static const ReverbRegisters kReverbPreset_StudioMedium =
+{
+	0x00B1, 0x007F, 0x70F0, 0x4FA8, 0xBCE0, 0x4510, 0xBEF0, 0xB4C0,
+	0x5280, 0x4EC0, 0x0904, 0x076B, 0x0824, 0x065F, 0x07A2, 0x0616,
+	0x076C, 0x05ED, 0x05EC, 0x042E, 0x050F, 0x0305, 0x0462, 0x02B7,
+	0x042F, 0x0265, 0x0264, 0x01B2, 0x0100, 0x0080, 0x8000, 0x8000,
+};
+
+// Studio Large (size=6FE0h bytes)
+static const ReverbRegisters kReverbPreset_StudioLarge =
+{
+	0x00E3, 0x00A9, 0x6F60, 0x4FA8, 0xBCE0, 0x4510, 0xBEF0, 0xA680,
+	0x5680, 0x52C0, 0x0DFB, 0x0B58, 0x0D09, 0x0A3C, 0x0BD9, 0x0973,
+	0x0B59, 0x08DA, 0x08D9, 0x05E9, 0x07EC, 0x04B0, 0x06EF, 0x03D2,
+	0x05EA, 0x031D, 0x031C, 0x0238, 0x0154, 0x00AA, 0x8000, 0x8000,
+};
+
+// Hall (size=ADE0h bytes)
+static const ReverbRegisters kReverbPreset_Hall =
+{
+	0x01A5, 0x0139, 0x6000, 0x5000, 0x4C00, 0xB800, 0xBC00, 0xC000,
+	0x6000, 0x5C00, 0x15BA, 0x11BB, 0x14C2, 0x10BD, 0x11BC, 0x0DC1,
+	0x11C0, 0x0DC3, 0x0DC0, 0x09C1, 0x0BC4, 0x07C1, 0x0A00, 0x06CD,
+	0x09C2, 0x05C1, 0x05C0, 0x041A, 0x0274, 0x013A, 0x8000, 0x8000,
+};
+
+// Half Echo (size=3C00h bytes)
+static const ReverbRegisters kReverbPreset_HalfEcho =
+{
+	0x0017, 0x0013, 0x70F0, 0x4FA8, 0xBCE0, 0x4510, 0xBEF0, 0x8500,
+	0x5F80, 0x54C0, 0x0371, 0x02AF, 0x02E5, 0x01DF, 0x02B0, 0x01D7,
+	0x0358, 0x026A, 0x01D6, 0x011E, 0x012D, 0x00B1, 0x011F, 0x0059,
+	0x01A0, 0x00E3, 0x0058, 0x0040, 0x0028, 0x0014, 0x8000, 0x8000,
+};
+
+// Space Echo (size=F6C0h bytes)
+static const ReverbRegisters kReverbPreset_SpaceEcho =
+{
+	0x033D, 0x0231, 0x7E00, 0x5000, 0xB400, 0xB000, 0x4C00, 0xB000,
+	0x6000, 0x5400, 0x1ED6, 0x1A31, 0x1D14, 0x183B, 0x1BC2, 0x16B2,
+	0x1A32, 0x15EF, 0x15EE, 0x1055, 0x1334, 0x0F2D, 0x11F6, 0x0C5D,
+	0x1056, 0x0AE1, 0x0AE0, 0x07A2, 0x0464, 0x0232, 0x8000, 0x8000,
+};
+
+// Chaos Echo (almost infinite) (size=18040h bytes)
+static const ReverbRegisters kReverbPreset_ChaosEcho =
+{
+	0x0001, 0x0001, 0x7FFF, 0x7FFF, 0x0000, 0x0000, 0x0000, 0x8100,
+	0x0000, 0x0000, 0x1FFF, 0x0FFF, 0x1005, 0x0005, 0x0000, 0x0000,
+	0x1005, 0x0005, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+	0x0000, 0x0000, 0x1004, 0x1002, 0x0004, 0x0002, 0x8000, 0x8000,
+};
+
+// Delay (one-shot echo) (size=18040h bytes)
+static const ReverbRegisters kReverbPreset_Delay =
+{
+	0x0001, 0x0001, 0x7FFF, 0x7FFF, 0x0000, 0x0000, 0x0000, 0x0000,
+	0x0000, 0x0000, 0x1FFF, 0x0FFF, 0x1005, 0x0005, 0x0000, 0x0000,
+	0x1005, 0x0005, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+	0x0000, 0x0000, 0x1004, 0x1002, 0x0004, 0x0002, 0x8000, 0x8000,
+};
+
+// Off (size=10h dummy bytes)
+static const ReverbRegisters kReverbPreset_Off =
+{
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001,
+  0x0000, 0x0000, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001,
+  0x0000, 0x0000, 0x0001, 0x0001, 0x0001, 0x0001, 0x0000, 0x0000,
+};
+
+static const ReverbRegisters kReverbPresets[] =
+{
+	kReverbPreset_Room,
+	kReverbPreset_StudioSmall,
+	kReverbPreset_StudioMedium,
+	kReverbPreset_StudioLarge,
+	kReverbPreset_Hall,
+	kReverbPreset_HalfEcho,
+	kReverbPreset_SpaceEcho,
+	kReverbPreset_ChaosEcho,
+	kReverbPreset_Delay,
+	kReverbPreset_Off,
+};
+static_assert(COUNTOF_ARRAY(kReverbPresets) == ENUM_COUNT(ReverbPreset));
+
+//--------------------------------------------------------------------------------------------------------
 
 static bool loadInput(const char* filename, s16*& buffer, size_t& numElements)
 {
@@ -212,16 +363,94 @@ static s16 saturateS32toS16(s32 val)
 	return (s16)Clamp(val, (s32)INT16_MIN, (s32)INT16_MAX);
 }
 
+static void printUsage(const char* programName)
+{
+	LOG_INFO("Usage: %s [options] <input file>\n", programName);
+	LOG_INFO("Options:\n");
+	LOG_INFO("  --help               Show this help message\n");
+	LOG_INFO("  --log-level <level>  Set log level: 2=trace, 1=debug, 0=info (default), -1=warn), -2=error -3=none\n");
+	LOG_INFO("  --preset <name>      Set reverb preset (default: Room)\n");
+}
+
 int main(int argc, char** argv)
 {
-	// Parse filename from command line arguments
-	if (argc < 2)
+	// Parse command line arguments
+	ReverbPreset preset = ReverbPreset::Room;
+	const char* inputFilename = nullptr;
+
+	for (int i = 1; i < argc; i++)
 	{
-		printUsage(argv[0]);
-		return EXIT_FAILURE;
+		const char* arg = argv[i];
+
+		if (strcmp(arg, "--help") == 0)
+		{
+			printUsage(argv[0]);
+			exit(EXIT_SUCCESS);
+		}
+		else if (strcmp(arg, "--log-level") == 0)
+		{
+			if (i + 1 == argc)
+			{
+				printUsage(argv[0]);
+				exit(EXIT_FAILURE);
+			}
+
+			arg = argv[++i];
+			if (arg[0] == '-')
+			{
+				printUsage(argv[0]);
+				exit(EXIT_FAILURE);
+			}
+
+			int logLevel;
+			if (!ParseInt(arg, logLevel) || logLevel < LOG_LEVEL_MIN || logLevel > LOG_LEVEL_MAX)
+			{
+				LOG_ERROR("Invalid log-level value\n");
+				printUsage(argv[0]);
+				exit(EXIT_FAILURE);
+			}
+			SetLogLevel(logLevel);
+		}
+		else if (strcmp(arg, "--preset") == 0)
+		{
+			if (i + 1 == argc)
+			{
+				printUsage(argv[0]);
+				exit(EXIT_FAILURE);
+			}
+			arg = argv[++i];
+			unsigned int presetIndex;
+			for (presetIndex = 0; presetIndex < ENUM_COUNT(ReverbPreset); presetIndex++)
+			{
+				if (Stricmp(arg, kReverbPresetNames[presetIndex]) == 0)
+				{
+					preset = (ReverbPreset)presetIndex;
+					break;
+				};
+			}
+			if (presetIndex == ENUM_COUNT(ReverbPreset))
+			{
+				LOG_ERROR("Invalid preset name: %s\n", arg);
+				LOG_INFO("Valid preset names are:\n");
+				for (presetIndex = 0; presetIndex < ENUM_COUNT(ReverbPreset); presetIndex++)
+				{
+					LOG_INFO("  %s\n", kReverbPresetNames[presetIndex]);
+				}
+				exit(EXIT_FAILURE);
+			}
+		}
+		else if (!inputFilename)
+		{
+			inputFilename = arg;
+		}
+		else
+		{
+			LOG_ERROR("Unrecognised command line arg: %s\n", arg);
+			printUsage(argv[0]);
+			exit(EXIT_FAILURE);
+		}
 	}
 
-	const char* inputFilename = argv[1];
 	s16* input;
 	size_t inputLengthSamples;
 	if (!loadInput(inputFilename, /*out*/input, /*out*/inputLengthSamples))
@@ -236,17 +465,14 @@ int main(int argc, char** argv)
 	}
 	size_t inputLengthFrames = inputLengthSamples >> 1; // stereo
 
-	ReverbRegisters regs{};
+	const ReverbRegisters& reverb = kReverbPresets[(int)preset];
 
-	// #TODO: Set reg values to proper values e.g. from https://psx-spx.consoledev.net/soundprocessingunitspu/#reverb-examples or BIOS.
-
-	// For volumes:
-	// - INT16_MAX 0x7fff is max volume
-	// - INT16_MIN 0x8000 -32768 is max negative volume and will invert the signal
-	regs.vLIN = 0x7fff;
-	regs.vRIN = 0x7fff;
-	regs.vLOUT = 0x7fff;
-	regs.vROUT = 0x7fff;
+	// All of the reverb presets seem to use 0x8000 for vLIN and vRIN.
+	// This is maximum negative volume and will invert the signal.
+	// So perform the same operation at the output to flip the signal back up again.
+	SpuRegisters spu{};
+	spu.vLOUT = INT16_MIN;
+	spu.vROUT = INT16_MIN;
 
 	s16 downsamplerRingbufferL[kFIRFilterSize]{};
 	s16 downsamplerRingbufferR[kFIRFilterSize]{};
@@ -316,8 +542,8 @@ int main(int argc, char** argv)
 			// Reverb
 
 			// Apply input volume vLIN, vRIN
-			s32 Lin = ((s32)regs.vLIN * LeftInput) >> 15; // / 0x8000;
-			s32 Rin = ((s32)regs.vRIN * RightInput) >> 15; // / 0x8000;
+			s32 Lin = ((s32)(s16)reverb.vLIN * LeftInput) >> 15; // / 0x8000;
+			s32 Rin = ((s32)(s16)reverb.vRIN * RightInput) >> 15; // / 0x8000;
 			
 			// #TEMP: Just copy the downsampled buffer into the reverb output buffer for now, will implement actual reverb processing later.
 			// #TODO: Implement reverb chain
@@ -325,8 +551,8 @@ int main(int argc, char** argv)
 			s32 Rout = Rin;
 
 			// Apply output volume vLOUT, vROUT
-			s32 LeftOutput = (Lout * (s32)regs.vLOUT) >> 15; // / 0x8000;
-			s32 RightOutput = (Rout * (s32)regs.vROUT) >> 15; // / 0x8000;
+			s32 LeftOutput = (Lout * (s32)spu.vLOUT) >> 15; // / 0x8000;
+			s32 RightOutput = (Rout * (s32)spu.vROUT) >> 15; // / 0x8000;
 
 			// Write the new reverb output values into the upsampler ring buffers
 			upsamplerRingbufferL[upsamplerRingbufferIndex] = saturateS32toS16(LeftOutput);
