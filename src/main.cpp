@@ -171,37 +171,6 @@ struct ReverbRegisters
 
 // Required memory size = 0x80000 - mBASE*8
 
-enum class ReverbPreset
-{
-	Room,
-	StudioSmall,
-	StudioMedium,
-	StudioLarge,
-	Hall,
-	HalfEcho,
-	SpaceEcho,
-	ChaosEcho,
-	Delay,
-	Off,
-
-	Max = Off
-};
-
-static const char* kReverbPresetNames[] =
-{
-	"Room",
-	"StudioSmall",
-	"StudioMedium",
-	"StudioLarge",
-	"Hall",
-	"HalfEcho",
-	"SpaceEcho",
-	"ChaosEcho",
-	"Delay",
-	"Off",
-};
-static_assert(COUNTOF_ARRAY(kReverbPresetNames) == ENUM_COUNT(ReverbPreset));
-
 // Room (size=26C0h bytes)
 static const ReverbRegisters kReverbPreset_Room =
 {
@@ -291,6 +260,37 @@ static const ReverbRegisters kReverbPreset_Off =
   0x0000, 0x0000, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001,
   0x0000, 0x0000, 0x0001, 0x0001, 0x0001, 0x0001, 0x0000, 0x0000,
 };
+
+enum class ReverbPreset
+{
+	Room,
+	StudioSmall,
+	StudioMedium,
+	StudioLarge,
+	Hall,
+	HalfEcho,
+	SpaceEcho,
+	ChaosEcho,
+	Delay,
+	Off,
+
+	Max = Off
+};
+
+static const char* kReverbPresetNames[] =
+{
+	"Room",
+	"StudioSmall",
+	"StudioMedium",
+	"StudioLarge",
+	"Hall",
+	"HalfEcho",
+	"SpaceEcho",
+	"ChaosEcho",
+	"Delay",
+	"Off",
+};
+static_assert(COUNTOF_ARRAY(kReverbPresetNames) == ENUM_COUNT(ReverbPreset));
 
 static const ReverbRegisters kReverbPresets[] =
 {
@@ -506,10 +506,10 @@ static s32 applyEarlyEcho(
 	s16 vComb1, s16 vComb2, s16 vComb3, s16 vComb4)
 {
 	s32 output = 0;
-	output += vComb1 * (s32)readReverbBuffer(spu, mComb1);
-	output += vComb2 * (s32)readReverbBuffer(spu, mComb2);
-	output += vComb3 * (s32)readReverbBuffer(spu, mComb3);
-	output += vComb4 * (s32)readReverbBuffer(spu, mComb4);
+	output += (s32)vComb1 * (s32)readReverbBuffer(spu, mComb1);
+	output += (s32)vComb2 * (s32)readReverbBuffer(spu, mComb2);
+	output += (s32)vComb3 * (s32)readReverbBuffer(spu, mComb3);
+	output += (s32)vComb4 * (s32)readReverbBuffer(spu, mComb4);
 	output >>= 15; // Rescale back down after multiplying by volume
 
 	return output;
