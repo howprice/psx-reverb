@@ -15,14 +15,21 @@ Note that n just means some index into the signal. It could be written as i.
 For full convolution, the length of the output signal is equal to the length of the input signal, plus the length of the impulse response, minus one.
 
 FIR Finite Impulse Response
+An impulse response that is of finite length. The output depends only on the current and a finite number of previous input samples.
+i.e. FIR filters do not use feedback.
+
+IIR Infinite Impulse Response
+An impulse response that is of infinite length. The output depends on the current and all previous input samples, as well as previous output samples.
+i.e. IIR filters use feedback.
 
 TODO
 ====
-- Reflection filters
+- Different side reflection
 - Add or identify BIOS reverb preset
 - Comb filters
 - All pass filters
 - Save mixed (dry + wet) output
+- vIIR -8000h bug https://psx-spx.consoledev.net/soundprocessingunitspu/#bug
 */
 
 #include "Parse.h"
@@ -98,7 +105,7 @@ static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == kFIRFilterSize);
 // - INT16_MAX 0x7fff is max volume
 // - INT16_MIN 0x8000 -32768 is max negative volume and will invert the signal
 // 
-// All src/dst/disp/base registers are addresses in SPU memory (divided by 8)
+// All src/dst/disp/base registers are addresses in SPU memory *divided by 8*.
 // src/dst are relative to the current buffer address
 // disp registers are relative to src registers
 // The base register defines the start address of the reverb buffer (the end address is fixed, at 7FFFEh).
@@ -107,11 +114,18 @@ static_assert(COUNTOF_ARRAY(kFiniteImpulseResponse) == kFIRFilterSize);
 // https://psx-spx.consoledev.net/soundprocessingunitspu/#spu-reverb-registers
 //
 
-struct SpuRegisters
+struct SPU
 {
+	static const unsigned int kRamSizeBytes = 512 * 1024; // 512 KB of SPU RAM
+	u8 ram[kRamSizeBytes];
+
 	s16 vLOUT;
 	s16 vROUT;
-	u16 mBASE;
+	u16 mBASE; // Reverb buffer start address. Extends to end of ram
+
+	u32 reverbBufferStart; // for convenience
+	u32 currentReverbBufferHead; // current reverb buffer head address. This is incremented after each pass of the reverb.
+	unsigned int reverbBufferSizeBytes; // extends from mBASE to end of RAM
 };
 
 // Reverb unit registers
@@ -179,7 +193,7 @@ enum class ReverbPreset
 static const char* kReverbPresetNames[] =
 {
 	"Room",
-	"StudioSmal",
+	"StudioSmall",
 	"StudioMedium",
 	"StudioLarge",
 	"Hall",
@@ -296,6 +310,21 @@ static const ReverbRegisters kReverbPresets[] =
 };
 static_assert(COUNTOF_ARRAY(kReverbPresets) == ENUM_COUNT(ReverbPreset));
 
+static unsigned int kReverbPresetBufferSizeBytes[] =
+{
+	0x26C0,  // Room
+	0x1F40,  // StudioSmall
+	0x4840,  // StudioMedium
+	0x6FE0,  // StudioLarge
+	0xADE0,  // Hall
+	0x3C00,  // HalfEcho
+	0xF6C0,  // SpaceEcho
+	0x18040, // ChaosEcho
+	0x18040, // Delay
+	0x0010,  // Off
+};
+static_assert(COUNTOF_ARRAY(kReverbPresetBufferSizeBytes) == ENUM_COUNT(ReverbPreset));
+
 //--------------------------------------------------------------------------------------------------------
 
 static bool loadInput(const char* filename, s16*& buffer, size_t& numElements)
@@ -361,6 +390,85 @@ static bool saveBuffer(const char* filename, s16* buffer, size_t numElements)
 static s16 saturateS32toS16(s32 val)
 {
 	return (s16)Clamp(val, (s32)INT16_MIN, (s32)INT16_MAX);
+}
+
+static inline u32 reverbAddrToRamAddr(const SPU& spu, u16 addressDiv8)
+{
+	u32 addr = spu.currentReverbBufferHead + (addressDiv8 * 8u);
+
+	// The PSX SPU reverb buffer always extends to the end of RAM.
+	if (addr >= SPU::kRamSizeBytes)
+		addr -= spu.reverbBufferSizeBytes;
+
+	return addr;
+}
+
+static s16 readReverbBuffer(const SPU& spu, u16 addressDiv8)
+{
+	u32 address = reverbAddrToRamAddr(spu, addressDiv8);
+	HP_ASSERT(address >= spu.reverbBufferStart && address + 2 <= SPU::kRamSizeBytes);
+	return *(s16*)(spu.ram + address);
+}
+
+static void writeReverbBuffer(SPU& spu, u16 addressDiv8, s16 val)
+{
+	u32 address = reverbAddrToRamAddr(spu, addressDiv8);
+	HP_ASSERT(address >= spu.reverbBufferStart && address + 2 <= SPU::kRamSizeBytes);
+	u16* pDst = (u16*)(spu.ram + address);
+	*pDst = val;
+}
+
+// Delay and filter. And mix the two together.
+// 
+// A delayed version of the input is added to the input and then blended with previous sample.
+//
+//     buf[m_addr] = (input + buf[d_addr]*vWALL - buf[m_addr-2])*vIIR + buf[m_addr-2]
+//
+// In DSP notation this is:
+// 
+//     y[n] = (x[n] + vWALL*y[n-D] - y[n-1])*vIIR + y[n-1]
+//
+// Where [m_addr-2] is the previous sample in the delay line.
+//
+// This can be rewritten to show that this is a weighted average of the new sample an the previous sample:
+//
+// buf[m_addr] = vIIR*(input + buf[d_addr]*vWALL) - vIIR*buf[m_addr-2] + buf[m_addr-2]
+// buf[m_addr] = vIIR*(input + buf[d_addr]*vWALL) + 1*buf[m_addr-2] - vIIR*buf[m_addr-2]
+// buf[m_addr] = vIIR*(input + buf[d_addr]*vWALL) + (1-vIIR)*buf[m_addr-2]
+//
+// In DSP notation this is:
+// 
+//     y[n] = vIIR*(x[n] + y[n-D]*vWALL) - (1-vIIR)*y[n-1]
+//
+// In jsgroth's blog post, 1-vIIR is written as 0x8000 - vIIR because volume is represented as a signed 16-bit value.
+//
+// High vIIR makes the reverb responsive to new inputs.
+// Low vIIR makes the reverb less responsive to new inputs, which creates a longer decay time.  This is a "Leaky Integrator"
+// which acts as a low pass filter by averaging inputs over time.
+//
+// It is an *Infinite* Impulse Response filter because the output depends on all previous inputs, as well as previous outputs (feedback).
+//
+// Note that the vIIR coefficient also applies to the tapped echo. This prevents the energy in the system from growing continually via feedback.
+//
+static s32 applyReflection(
+	SPU& spu,
+	s32 input,
+	u16 m_addr,
+	u16 d_addr, // delayed tap taken from buffer
+	s16 vIIR, // Feedback coefficient. Controls decay time
+	s16 vWALL) // Reflection coefficient. The "hardness" of the room's walls
+{
+	s32 prev = (s32)readReverbBuffer(spu, m_addr - 2);
+	s32 tap = (s32)readReverbBuffer(spu, d_addr); // tap a previous sample to generate delay
+	s32 reflection = (tap * vWALL) >> 15; // Rescale back down after multiplying by volume
+
+	// Lerp between new input+delay and previous output
+	s32 output = ((input + reflection - prev) * vIIR) >> 15; // Rescale back down after multiplying by volume
+	output += prev;
+
+	writeReverbBuffer(spu, m_addr, saturateS32toS16(output));
+
+	return output;
 }
 
 static void printUsage(const char* programName)
@@ -466,13 +574,25 @@ int main(int argc, char** argv)
 	size_t inputLengthFrames = inputLengthSamples >> 1; // stereo
 
 	const ReverbRegisters& reverb = kReverbPresets[(int)preset];
+	LOG_INFO("Reverb preset: %s\n", kReverbPresetNames[(int)preset]);
 
 	// All of the reverb presets seem to use 0x8000 for vLIN and vRIN.
 	// This is maximum negative volume and will invert the signal.
 	// So perform the same operation at the output to flip the signal back up again.
-	SpuRegisters spu{};
+	SPU spu{};
 	spu.vLOUT = INT16_MIN;
 	spu.vROUT = INT16_MIN;
+	spu.mBASE = (u16)(0x70000 >> 3); // Representative value for testing
+
+	spu.reverbBufferStart = spu.mBASE * 8; // Convert from address in sound ram (divided by 8) to byte address
+
+	// Writing to mBASE set the current buffer address to that value.
+	spu.currentReverbBufferHead = spu.reverbBufferStart;
+
+	// Calculate the reverb buffer size, which is required for accessing reverb buffer memory
+	HP_ASSERT(spu.currentReverbBufferHead <= SPU::kRamSizeBytes);
+	spu.reverbBufferSizeBytes = SPU::kRamSizeBytes - spu.currentReverbBufferHead;
+	HP_ASSERT(spu.reverbBufferSizeBytes >= kReverbPresetBufferSizeBytes[(int)preset]); // Reverb buffer size must fit in available ram
 
 	s16 downsamplerRingbufferL[kFIRFilterSize]{};
 	s16 downsamplerRingbufferR[kFIRFilterSize]{};
@@ -545,10 +665,21 @@ int main(int argc, char** argv)
 			s32 Lin = ((s32)(s16)reverb.vLIN * LeftInput) >> 15; // / 0x8000;
 			s32 Rin = ((s32)(s16)reverb.vRIN * RightInput) >> 15; // / 0x8000;
 			
-			// #TEMP: Just copy the downsampled buffer into the reverb output buffer for now, will implement actual reverb processing later.
-			// #TODO: Implement reverb chain
-			s32 Lout = Lin;
-			s32 Rout = Rin;
+			// Reverb chain
+			
+			// Same Side Reflection (left-to-left and right-to-right)
+			// [mLSAME] = (Lin + [dLSAME]*vWALL - [mLSAME-2])*vIIR + [mLSAME-2]  ;L-to-L
+			// [mRSAME] = (Rin + [dRSAME]*vWALL - [mRSAME-2])*vIIR + [mRSAME-2]  ;R-to-R
+			s32 LSAME = applyReflection(spu, Lin, reverb.mLSAME, reverb.dLSAME, reverb.vIIR, reverb.vWALL);
+			s32 RSAME = applyReflection(spu, Rin, reverb.mRSAME, reverb.dRSAME, reverb.vIIR, reverb.vWALL);
+
+			// #TODO: Different Side Reflection (left-to-right and right-to-left)
+			// #TODO: Early Echo (Comb Filter, with input from buffer)
+			// #TODO: Late Reverb APF1 (All Pass Filter 1, with input from COMB)
+			// #TODO: Late Reverb APF2 (All Pass Filter 2, with input from APF1)
+			// #TEMP: Just copy the Same Side Reflection output into output
+			s32 Lout = LSAME;
+			s32 Rout = RSAME;
 
 			// Apply output volume vLOUT, vROUT
 			s32 LeftOutput = (Lout * (s32)spu.vLOUT) >> 15; // / 0x8000;
@@ -562,6 +693,12 @@ int main(int argc, char** argv)
 			HP_DEBUG_ASSERT(reverbOutputBufferLenSamples + 2 <= reverbOutputBufferCapacitySamples); // should never fail by construction
 			reverbOutputBuffer[reverbOutputBufferLenSamples++] = upsamplerRingbufferL[upsamplerRingbufferIndex];
 			reverbOutputBuffer[reverbOutputBufferLenSamples++] = upsamplerRingbufferR[upsamplerRingbufferIndex];
+
+			// Increment and wrap reverb buffer current head position.
+			// Note that each reverb stage has separate buffers for L and R so only need to advance by 1 sample (2 bytes) per cycle, not 2 samples for stereo.
+			spu.currentReverbBufferHead += 2;
+			if (spu.currentReverbBufferHead >= SPU::kRamSizeBytes)
+				spu.currentReverbBufferHead -= spu.reverbBufferSizeBytes;
 		}
 		else
 		{
