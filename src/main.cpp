@@ -24,11 +24,8 @@ i.e. IIR filters use feedback.
 
 TODO
 ====
-- Different side reflection
-- Add or identify BIOS reverb preset
-- Comb filters
 - All pass filters
-- Save mixed (dry + wet) output
+- Add or identify BIOS reverb preset
 - vIIR -8000h bug https://psx-spx.consoledev.net/soundprocessingunitspu/#bug
 */
 
@@ -629,7 +626,7 @@ int main(int argc, char** argv)
 	SPU spu{};
 	spu.vLOUT = INT16_MIN;
 	spu.vROUT = INT16_MIN;
-	spu.mBASE = (u16)(0x70000 >> 3); // Representative value for testing
+	spu.mBASE = (u16)(0x60000 >> 3); // Representative value for testing
 
 	spu.reverbBufferStart = spu.mBASE * 8; // Convert from address in sound ram (divided by 8) to byte address
 
@@ -678,12 +675,20 @@ int main(int argc, char** argv)
 	s16* upsampledBuffer = new s16[upsampledBufferCapacitySamples];
 	size_t upsampledBufferLenSamples = 0;
 
+	// Mixed wet output
+	const size_t mixedOutputBufferCapacitySamples = inputLengthSamples; // same length as input buffer
+	s16* mixedOutputBuffer = new s16[mixedOutputBufferCapacitySamples];
+	size_t mixedOutputBufferLenSamples = 0;
+
 	// This would be called at 44100 Hz, every 768 cycles on PSX
 	for (unsigned int inputFrameIndex = 0; inputFrameIndex < inputLengthFrames; inputFrameIndex++)
 	{
+		const s16 inputSampleL = input[2 * inputFrameIndex]; // Left sample of current stereo frame
+		const s16 inputSampleR = input[2 * inputFrameIndex + 1]; // Right sample of current stereo frame
+
 		// The downsampler ring buffers must be fed every tick.
-		downsamplerRingbufferL[downsamplerRingbufferIndex] = input[2 * inputFrameIndex]; // Left sample of current stereo frame
-		downsamplerRingbufferR[downsamplerRingbufferIndex] = input[2 * inputFrameIndex + 1]; // Right sample of current stereo frame
+		downsamplerRingbufferL[downsamplerRingbufferIndex] = inputSampleL; // Left sample of current stereo frame
+		downsamplerRingbufferR[downsamplerRingbufferIndex] = inputSampleR; // Right sample of current stereo frame
 
 		// Reverb is processed every other cycle i.e. at 22050 Hz
 		if ((inputFrameIndex & 1) == 0)
@@ -782,30 +787,37 @@ int main(int argc, char** argv)
 
 		// Upsample from 22050 Hz back to 44100 Hz
 		// In the PSX SPU reverb unit, this is achieved with "zero stuffing" every other element and convolving with the same FIR filter.
+		s32 upsampledL = 0;
+		s32 upsampledR = 0;
+		for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
 		{
-			s32 sumL = 0;
-			s32 sumR = 0;
-			for (size_t j = 0; j < COUNTOF_ARRAY(kFiniteImpulseResponse); j++)
-			{
-				int inputIndex = (int)upsamplerRingbufferIndex - (int)j;
-				if (inputIndex < 0)
-					inputIndex += COUNTOF_ARRAY(upsamplerRingbufferL); // Wrap around; circular buffer
+			int inputIndex = (int)upsamplerRingbufferIndex - (int)j;
+			if (inputIndex < 0)
+				inputIndex += COUNTOF_ARRAY(upsamplerRingbufferL); // Wrap around; circular buffer
 
-				s32 h = (s32)kFiniteImpulseResponse[j]; // impulse response
-				sumL += (s32)upsamplerRingbufferL[inputIndex] * h;
-				sumR += (s32)upsamplerRingbufferR[inputIndex] * h;
-			}
-
-			// The coefficients in the FIR table represent volume multipler N/0x8000 so should rescale by dividing by 0x8000 (shifting right by 15) to compensate for this.
-			// However, because of the zero stuffing, every other sample in the input is zero, the volume will be halved compared to the downsampled signal,
-			// so instead of rescaling by 0x8000, we can rescale by 0x4000 (shifting right by 14)
-			sumL >>= 14;
-			sumR >>= 14;
-
-			HP_DEBUG_ASSERT(upsampledBufferLenSamples + 2 <= upsampledBufferCapacitySamples); // should never fail by construction
-			upsampledBuffer[upsampledBufferLenSamples++] = saturateS32toS16(sumL);
-			upsampledBuffer[upsampledBufferLenSamples++] = saturateS32toS16(sumR);
+			s32 h = (s32)kFiniteImpulseResponse[j]; // impulse response
+			upsampledL += (s32)upsamplerRingbufferL[inputIndex] * h;
+			upsampledR += (s32)upsamplerRingbufferR[inputIndex] * h;
 		}
+
+		// The coefficients in the FIR table represent volume multipler N/0x8000 so should rescale by dividing by 0x8000 (shifting right by 15) to compensate for this.
+		// However, because of the zero stuffing, every other sample in the input is zero, the volume will be halved compared to the downsampled signal,
+		// so instead of rescaling by 0x8000, we can rescale by 0x4000 (shifting right by 14)
+		upsampledL >>= 14;
+		upsampledR >>= 14;
+
+		HP_DEBUG_ASSERT(upsampledBufferLenSamples + 2 <= upsampledBufferCapacitySamples); // should never fail by construction
+		upsampledL = saturateS32toS16(upsampledL);
+		upsampledR = saturateS32toS16(upsampledR);
+		upsampledBuffer[upsampledBufferLenSamples++] = (s16)upsampledL;
+		upsampledBuffer[upsampledBufferLenSamples++] = (s16)upsampledR;
+
+		// Mix the dry input with the reverb output. The reverb output is already scaled by vLOUT and vROUT, so just need to add them together.
+		s32 mixedL = (s32)inputSampleL + upsampledL;
+		s32 mixedR = (s32)inputSampleR + upsampledR;
+		HP_DEBUG_ASSERT(mixedOutputBufferLenSamples + 2 <= mixedOutputBufferCapacitySamples); // should never fail by construction
+		mixedOutputBuffer[mixedOutputBufferLenSamples++] = saturateS32toS16(mixedL);
+		mixedOutputBuffer[mixedOutputBufferLenSamples++] = saturateS32toS16(mixedR);
 
 		// Increment this after calculating the output sample for the current input, so that the current input is included in the FIR filter calculation for the next output sample.
 		downsamplerRingbufferIndex++;
@@ -844,6 +856,10 @@ int main(int argc, char** argv)
 	saveBuffer("upsampled.raw", upsampledBuffer, upsampledBufferLenSamples);
 	delete[] upsampledBuffer;
 	upsampledBuffer = nullptr;
+
+	saveBuffer("mixed_output.raw", mixedOutputBuffer, mixedOutputBufferLenSamples);
+	delete[] mixedOutputBuffer;
+	mixedOutputBuffer = nullptr;
 
     return EXIT_SUCCESS;
 }
