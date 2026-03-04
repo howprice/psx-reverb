@@ -400,6 +400,8 @@ static inline u32 reverbAddrToRamAddr(const SPU& spu, u16 addressDiv8)
 	if (addr >= SPU::kRamSizeBytes)
 		addr -= spu.reverbBufferSizeBytes;
 
+	HP_ASSERT(addr >= spu.reverbBufferStart && addr < SPU::kRamSizeBytes);
+
 	return addr;
 }
 
@@ -410,10 +412,25 @@ static s16 readReverbBuffer(const SPU& spu, u16 addressDiv8)
 	return *(s16*)(spu.ram + address);
 }
 
+[[maybe_unused]]
 static void writeReverbBuffer(SPU& spu, u16 addressDiv8, s16 val)
 {
 	u32 address = reverbAddrToRamAddr(spu, addressDiv8);
 	HP_ASSERT(address >= spu.reverbBufferStart && address + 2 <= SPU::kRamSizeBytes);
+	u16* pDst = (u16*)(spu.ram + address);
+	*pDst = val;
+}
+
+static s16 readRAM(const SPU& spu, u32 address)
+{
+	HP_ASSERT(address + 2 <= SPU::kRamSizeBytes);
+	s16 val = *(s16*)(spu.ram + address);
+	return val;
+}
+
+static void writeRAM(SPU& spu, u32 address, s16 val)
+{
+	HP_ASSERT(address + 2 <= SPU::kRamSizeBytes);
 	u16* pDst = (u16*)(spu.ram + address);
 	*pDst = val;
 }
@@ -458,15 +475,45 @@ static s32 applyReflection(
 	s16 vIIR, // Feedback coefficient. Controls decay time
 	s16 vWALL) // Reflection coefficient. The "hardness" of the room's walls
 {
-	s32 prev = (s32)readReverbBuffer(spu, m_addr - 2);
-	s32 tap = (s32)readReverbBuffer(spu, d_addr); // tap a previous sample to generate delay
-	s32 reflection = (tap * vWALL) >> 15; // Rescale back down after multiplying by volume
+	u32 outputAddr = reverbAddrToRamAddr(spu, m_addr);
+
+	// previous output sample y[n-1]
+	u32 prevAddr = outputAddr > spu.reverbBufferStart ? outputAddr - 2 : SPU::kRamSizeBytes - 2; // the reverb buffer always extends to the end of RAM, so wrap around to there
+	s32 prev = (s32)readRAM(spu, prevAddr);
+
+	// tap sample for echo
+	u32 tapAddr = reverbAddrToRamAddr(spu, d_addr);
+	s32 tap = (s32)readRAM(spu, tapAddr); // tap a previous sample to generate delay
+
+	s32 reflection = (tap * vWALL) >> 15; // Apply volume, and rescale back down to signed 16-bit range
 
 	// Lerp between new input+delay and previous output
 	s32 output = ((input + reflection - prev) * vIIR) >> 15; // Rescale back down after multiplying by volume
 	output += prev;
 
-	writeReverbBuffer(spu, m_addr, saturateS32toS16(output));
+	writeRAM(spu, outputAddr, saturateS32toS16(output));
+
+	return output;
+}
+
+// Comb filter to simulate hearing the same sound arriving at different times from different paths through the room.
+// It is called a comb filter because of the characterisic shape of the frequency response, which has regularly spaced peaks and troughs like a comb.
+// The delay time determines the spacing of the peaks and troughs, and the feedback volume determines how pronounced they are.
+// The peaks and troughs are generated due to constructive and destructive interference between the direct sound and the delayed sound.
+//
+// out=vCOMB1*[mCOMB1] + vCOMB2*[mCOMB2] + vCOMB3*[mCOMB3] + vCOMB4*[mCOMB4]
+//
+static s32 applyEarlyEcho(
+	const SPU& spu,
+	u16 mComb1, u16 mComb2, u16 mComb3, u16 mComb4,
+	s16 vComb1, s16 vComb2, s16 vComb3, s16 vComb4)
+{
+	s32 output = 0;
+	output += vComb1 * (s32)readReverbBuffer(spu, mComb1);
+	output += vComb2 * (s32)readReverbBuffer(spu, mComb2);
+	output += vComb3 * (s32)readReverbBuffer(spu, mComb3);
+	output += vComb4 * (s32)readReverbBuffer(spu, mComb4);
+	output >>= 15; // Rescale back down after multiplying by volume
 
 	return output;
 }
@@ -604,23 +651,31 @@ int main(int argc, char** argv)
 
 	// Create some intermediate buffers for debugging
 
-	// Debug buffer
 	// For full convolution, the length of the output signal is equal to the length of the input signal, plus the length of the impulse response, minus one.
 	// However we are downsampling by 2, so the output length is half of the input length. We can calculate the output capacity based on this.
 	const size_t downsampledBufferCapacitySamples = inputLengthSamples / 2; // Downsample by 2, so output capacity is half of input length
 	s16* downsampledBuffer = new s16[downsampledBufferCapacitySamples]; // single buffer containing stereo samplees
 	size_t downsampledBufferLenSamples = 0; // Will be set by downsample function
 
-	// Debug buffer
-	// Reverb is performed at 22050 Hz
-	const size_t reverbOutputBufferCapacitySamples = downsampledBufferCapacitySamples;
+	const size_t sameSideReflectionBufferCapacitySamples = downsampledBufferCapacitySamples;
+	s16* sameSideReflectionBuffer = new s16[sameSideReflectionBufferCapacitySamples]; // single buffer containing stereo samplees
+	size_t sameSideReflectionBufferLenSamples = 0;
+
+	const size_t differentSideReflectionBufferCapacitySamples = downsampledBufferCapacitySamples;
+	s16* differentSideReflectionBuffer = new s16[differentSideReflectionBufferCapacitySamples]; // single buffer containing stereo samplees
+	size_t differentSideReflectionBufferLenSamples = 0;
+
+	const size_t earlyEchoBufferCapacitySamples = downsampledBufferCapacitySamples;
+	s16* earlyEchoBuffer = new s16[earlyEchoBufferCapacitySamples]; // single buffer containing stereo samplees
+	size_t earlyEchoBufferLenSamples = 0;
+
+	const size_t reverbOutputBufferCapacitySamples = downsampledBufferCapacitySamples; // Reverb is performed at 22050 Hz
 	s16* reverbOutputBuffer = new s16[reverbOutputBufferCapacitySamples];
 	size_t reverbOutputBufferLenSamples = 0;
 
-	// Debug buffer
 	// Final output from reverb output upsampled back to 44100 Hz
-	const size_t upsampledBufferCapacitySamples = inputLengthSamples; // Upsample by 2, so output capacity is double the downsampled length
-	s16* upsampledBuffer = new s16[upsampledBufferCapacitySamples]; // Upsample by 2, so output capacity is double the downsampled length
+	const size_t upsampledBufferCapacitySamples = inputLengthSamples; // Upsample by 2, so same length as input buffer
+	s16* upsampledBuffer = new s16[upsampledBufferCapacitySamples];
 	size_t upsampledBufferLenSamples = 0;
 
 	// This would be called at 44100 Hz, every 768 cycles on PSX
@@ -672,23 +727,32 @@ int main(int argc, char** argv)
 			//   [mRSAME] = (Rin + [dRSAME]*vWALL - [mRSAME-2])*vIIR + [mRSAME-2]  ;R-to-R
 			s32 LSAME = applyReflection(spu, Lin, reverb.mLSAME, reverb.dLSAME, reverb.vIIR, reverb.vWALL);
 			s32 RSAME = applyReflection(spu, Rin, reverb.mRSAME, reverb.dRSAME, reverb.vIIR, reverb.vWALL);
-
+			HP_DEBUG_ASSERT(sameSideReflectionBufferLenSamples + 2 <= sameSideReflectionBufferCapacitySamples); // should never fail by construction
 			// The outputs aren't used directly. They are written to memory and read by the subsequent comb filters.
-			HP_UNUSED(LSAME);
-			HP_UNUSED(RSAME);
+			sameSideReflectionBuffer[sameSideReflectionBufferLenSamples++] = saturateS32toS16(LSAME);
+			sameSideReflectionBuffer[sameSideReflectionBufferLenSamples++] = saturateS32toS16(RSAME);
 
 			// Different Side Reflection (left-to-right and right-to-left)
 			//   [mLDIFF] = (Lin + [dRDIFF]*vWALL - [mLDIFF-2])*vIIR + [mLDIFF-2]  ;R-to-L   n.b. This uses the *right* delay tap dRDIFF to bounce the signal from left to right
 			//   [mRDIFF] = (Rin + [dLDIFF]*vWALL - [mRDIFF-2])*vIIR + [mRDIFF-2]  ;L-to-R   n.b. This uses the *left* delay tap dLDIFF to bounce the signal from right to left
 			s32 LDIFF = applyReflection(spu, Lin, reverb.mLDIFF, reverb.dRDIFF, reverb.vIIR, reverb.vWALL);
 			s32 RDIFF = applyReflection(spu, Rin, reverb.mRDIFF, reverb.dLDIFF, reverb.vIIR, reverb.vWALL);
+			// The outputs aren't used directly. They are written to memory and read by the subsequent comb filters.
+			HP_DEBUG_ASSERT(differentSideReflectionBufferLenSamples + 2 <= differentSideReflectionBufferCapacitySamples); // should never fail by construction
+			differentSideReflectionBuffer[differentSideReflectionBufferLenSamples++] = saturateS32toS16(LDIFF);
+			differentSideReflectionBuffer[differentSideReflectionBufferLenSamples++] = saturateS32toS16(RDIFF);
 
-			// #TODO: Early Echo (Comb Filter, with input from buffer)
+			// Early Echo (Comb Filter, with input from buffer)
+			//   Lout=vCOMB1*[mLCOMB1]+vCOMB2*[mLCOMB2]+vCOMB3*[mLCOMB3]+vCOMB4*[mLCOMB4]
+			//   Rout=vCOMB1*[mRCOMB1]+vCOMB2*[mRCOMB2]+vCOMB3*[mRCOMB3]+vCOMB4*[mRCOMB4]
+			s32 Lout = applyEarlyEcho(spu, reverb.mLCOMB1, reverb.mLCOMB2, reverb.mLCOMB3, reverb.mLCOMB4, reverb.vCOMB1, reverb.vCOMB2, reverb.vCOMB3, reverb.vCOMB4);
+			s32 Rout = applyEarlyEcho(spu, reverb.mRCOMB1, reverb.mRCOMB2, reverb.mRCOMB3, reverb.mRCOMB4, reverb.vCOMB1, reverb.vCOMB2, reverb.vCOMB3, reverb.vCOMB4);
+			HP_DEBUG_ASSERT(earlyEchoBufferLenSamples + 2 <= earlyEchoBufferCapacitySamples); // should never fail by construction
+			earlyEchoBuffer[earlyEchoBufferLenSamples++] = saturateS32toS16(Lout);
+			earlyEchoBuffer[earlyEchoBufferLenSamples++] = saturateS32toS16(Rout);
+
 			// #TODO: Late Reverb APF1 (All Pass Filter 1, with input from COMB)
 			// #TODO: Late Reverb APF2 (All Pass Filter 2, with input from APF1)
-			// #TEMP: Just copy the Reflection output into output
-			s32 Lout = LDIFF;
-			s32 Rout = RDIFF;
 
 			// Apply output volume vLOUT, vROUT
 			s32 LeftOutput = (Lout * (s32)spu.vLOUT) >> 15; // / 0x8000;
@@ -760,6 +824,18 @@ int main(int argc, char** argv)
 	saveBuffer("downsampled.raw", downsampledBuffer, downsampledBufferLenSamples);
 	delete[] downsampledBuffer;
 	downsampledBuffer = nullptr;
+
+	saveBuffer("same_side_reflection.raw", sameSideReflectionBuffer, sameSideReflectionBufferLenSamples);
+	delete[] sameSideReflectionBuffer;
+	sameSideReflectionBuffer = nullptr;
+
+	saveBuffer("different_side_reflection.raw", differentSideReflectionBuffer, differentSideReflectionBufferLenSamples);
+	delete[] differentSideReflectionBuffer;
+	differentSideReflectionBuffer = nullptr;
+
+	saveBuffer("early_echo.raw", earlyEchoBuffer, earlyEchoBufferLenSamples);
+	delete[] earlyEchoBuffer;
+	earlyEchoBuffer = nullptr;
 
 	saveBuffer("reverb_out.raw", reverbOutputBuffer, reverbOutputBufferLenSamples);
 	delete[] reverbOutputBuffer;
