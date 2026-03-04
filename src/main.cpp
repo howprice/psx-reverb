@@ -401,7 +401,7 @@ static inline u32 reverbAddrToRamAddr(const SPU& spu, u16 addressDiv8)
 	return addr;
 }
 
-static s16 readReverbBuffer(const SPU& spu, u16 addressDiv8)
+static s16 readSampleFromReverbBuffer(const SPU& spu, u16 addressDiv8)
 {
 	u32 address = reverbAddrToRamAddr(spu, addressDiv8);
 	HP_ASSERT(address >= spu.reverbBufferStart && address + 2 <= SPU::kRamSizeBytes);
@@ -409,7 +409,7 @@ static s16 readReverbBuffer(const SPU& spu, u16 addressDiv8)
 }
 
 [[maybe_unused]]
-static void writeReverbBuffer(SPU& spu, u16 addressDiv8, s16 val)
+static void writeSampleToReverbBuffer(SPU& spu, u16 addressDiv8, s16 val)
 {
 	u32 address = reverbAddrToRamAddr(spu, addressDiv8);
 	HP_ASSERT(address >= spu.reverbBufferStart && address + 2 <= SPU::kRamSizeBytes);
@@ -417,7 +417,7 @@ static void writeReverbBuffer(SPU& spu, u16 addressDiv8, s16 val)
 	*pDst = val;
 }
 
-static s16 readRAM(const SPU& spu, u32 address)
+static s16 readSampleFromRAM(const SPU& spu, u32 address)
 {
 	HP_ASSERT(address + 2 <= SPU::kRamSizeBytes);
 
@@ -428,7 +428,7 @@ static s16 readRAM(const SPU& spu, u32 address)
 	return val;
 }
 
-static void writeRAM(SPU& spu, u32 address, s16 val)
+static void writeSampleToRAM(SPU& spu, u32 address, s16 val)
 {
 	HP_ASSERT(address + 2 <= SPU::kRamSizeBytes);
 
@@ -483,11 +483,11 @@ static s32 applyReflection(
 
 	// previous output sample y[n-1]
 	u32 prevAddr = outputAddr > spu.reverbBufferStart ? outputAddr - 2 : SPU::kRamSizeBytes - 2; // the reverb buffer always extends to the end of RAM, so wrap around to there
-	s32 prev = (s32)readRAM(spu, prevAddr);
+	s32 prev = (s32)readSampleFromRAM(spu, prevAddr);
 
 	// tap sample for echo
 	u32 tapAddr = reverbAddrToRamAddr(spu, d_addr);
-	s32 tap = (s32)readRAM(spu, tapAddr); // tap a previous sample to generate delay
+	s32 tap = (s32)readSampleFromRAM(spu, tapAddr); // tap a previous sample to generate delay
 
 	s32 reflection = (tap * vWALL) >> 15; // Apply volume, and rescale back down to signed 16-bit range
 
@@ -495,7 +495,7 @@ static s32 applyReflection(
 	s32 output = ((input + reflection - prev) * vIIR) >> 15; // Rescale back down after multiplying by volume
 	output += prev;
 
-	writeRAM(spu, outputAddr, saturateS32toS16(output));
+	writeSampleToRAM(spu, outputAddr, saturateS32toS16(output));
 
 	return output;
 }
@@ -513,10 +513,10 @@ static s32 applyEarlyEcho(
 	s16 vComb1, s16 vComb2, s16 vComb3, s16 vComb4)
 {
 	s32 output = 0;
-	output += (s32)vComb1 * (s32)readReverbBuffer(spu, mComb1);
-	output += (s32)vComb2 * (s32)readReverbBuffer(spu, mComb2);
-	output += (s32)vComb3 * (s32)readReverbBuffer(spu, mComb3);
-	output += (s32)vComb4 * (s32)readReverbBuffer(spu, mComb4);
+	output += (s32)vComb1 * (s32)readSampleFromReverbBuffer(spu, mComb1);
+	output += (s32)vComb2 * (s32)readSampleFromReverbBuffer(spu, mComb2);
+	output += (s32)vComb3 * (s32)readSampleFromReverbBuffer(spu, mComb3);
+	output += (s32)vComb4 * (s32)readSampleFromReverbBuffer(spu, mComb4);
 	output >>= 15; // Rescale back down after multiplying by volume
 
 	return output;
@@ -551,11 +551,11 @@ static s32 applyLateReverb(
 	HP_ASSERT(delayedSampleAddr >= spu.reverbBufferStart && delayedSampleAddr + 2 <= SPU::kRamSizeBytes);
 
 	// out = in - (vAPF * buf[m_addr-d_addr])
-	s16 delayedSample = readRAM(spu, delayedSampleAddr);
+	s16 delayedSample = readSampleFromRAM(spu, delayedSampleAddr);
 	s32 output = input - ((vAPF * delayedSample) >> 15); // Apply volume, and rescale back down to signed 16-bit range
 
 	// buf[m_addr] = out
-	writeRAM(spu, addr, saturateS32toS16(output));
+	writeSampleToRAM(spu, addr, saturateS32toS16(output));
 
 	// out = (out * vAPF) + buf[m_addr-d_addr]
 	output = (output * vAPF) >> 15; // Rescale back down after multiplying by volume
