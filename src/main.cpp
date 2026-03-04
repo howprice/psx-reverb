@@ -686,7 +686,11 @@ int main(int argc, char** argv)
 	// Calculate the reverb buffer size, which is required for accessing reverb buffer memory
 	HP_ASSERT(pSpu->currentReverbBufferHead <= SPU::kRamSizeBytes);
 	pSpu->reverbBufferSizeBytes = SPU::kRamSizeBytes - pSpu->currentReverbBufferHead;
-	HP_ASSERT(pSpu->reverbBufferSizeBytes >= kReverbPresetBufferSizeBytes[(int)preset]); // Reverb buffer size must fit in available ram
+	if (kReverbPresetBufferSizeBytes[(int)preset] > pSpu->reverbBufferSizeBytes)
+	{
+		LOG_ERROR("Reverb buffer too small for preset. Decrease mBASE.\n");
+		return EXIT_FAILURE;
+	}
 
 	s16 downsamplerRingbufferL[kFIRFilterSize]{};
 	s16 downsamplerRingbufferR[kFIRFilterSize]{};
