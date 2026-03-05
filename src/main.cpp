@@ -564,13 +564,18 @@ static s32 applyLateReverb(
 	return output;
 }
 
-static void printUsage(const char* programName)
+static void printUsage()
 {
-	LOG_INFO("Usage: %s [options] <input file>\n", programName);
+	LOG_INFO("Usage: psx-reverb [options] <input file>\n");
 	LOG_INFO("Options:\n");
 	LOG_INFO("  --help               Show this help message\n");
 	LOG_INFO("  --log-level <level>  Set log level: 2=trace, 1=debug, 0=info (default), -1=warn), -2=error -3=none\n");
-	LOG_INFO("  --preset <name>      Set reverb preset (default: Room)\n");
+	LOG_INFO("  --preset <name>      Set reverb preset (case-insensitive, default: Room)\n");
+	LOG_INFO("Valid preset names are:\n");
+	for (unsigned int presetIndex = 0; presetIndex < ENUM_COUNT(ReverbPreset); presetIndex++)
+	{
+		LOG_INFO("    %s\n", kReverbPresetNames[presetIndex]);
+	}
 }
 
 int main(int argc, char** argv)
@@ -585,21 +590,21 @@ int main(int argc, char** argv)
 
 		if (strcmp(arg, "--help") == 0)
 		{
-			printUsage(argv[0]);
+			printUsage();
 			exit(EXIT_SUCCESS);
 		}
 		else if (strcmp(arg, "--log-level") == 0)
 		{
 			if (i + 1 == argc)
 			{
-				printUsage(argv[0]);
+				printUsage();
 				exit(EXIT_FAILURE);
 			}
 
 			arg = argv[++i];
 			if (arg[0] == '-')
 			{
-				printUsage(argv[0]);
+				printUsage();
 				exit(EXIT_FAILURE);
 			}
 
@@ -607,7 +612,7 @@ int main(int argc, char** argv)
 			if (!ParseInt(arg, logLevel) || logLevel < LOG_LEVEL_MIN || logLevel > LOG_LEVEL_MAX)
 			{
 				LOG_ERROR("Invalid log-level value\n");
-				printUsage(argv[0]);
+				printUsage();
 				exit(EXIT_FAILURE);
 			}
 			SetLogLevel(logLevel);
@@ -616,7 +621,7 @@ int main(int argc, char** argv)
 		{
 			if (i + 1 == argc)
 			{
-				printUsage(argv[0]);
+				printUsage();
 				exit(EXIT_FAILURE);
 			}
 			arg = argv[++i];
@@ -635,7 +640,7 @@ int main(int argc, char** argv)
 				LOG_INFO("Valid preset names are:\n");
 				for (presetIndex = 0; presetIndex < ENUM_COUNT(ReverbPreset); presetIndex++)
 				{
-					LOG_INFO("  %s\n", kReverbPresetNames[presetIndex]);
+					LOG_INFO("    %s\n", kReverbPresetNames[presetIndex]);
 				}
 				exit(EXIT_FAILURE);
 			}
@@ -647,9 +652,15 @@ int main(int argc, char** argv)
 		else
 		{
 			LOG_ERROR("Unrecognised command line arg: %s\n", arg);
-			printUsage(argv[0]);
+			printUsage();
 			exit(EXIT_FAILURE);
 		}
+	}
+
+	if (!inputFilename)
+	{
+		printUsage();
+		exit(EXIT_FAILURE);
 	}
 
 	s16* input;

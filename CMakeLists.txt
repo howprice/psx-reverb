@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(dsp)
+project(psx-reverb)
 
-set(DSP_TARGET "dsp")
+set(PSX_REVERB_TARGET "psx-reverb")
 
-add_executable(${DSP_TARGET})
+add_executable(${PSX_REVERB_TARGET})
 
 set(SRC_LIST
 	"src/ArrayHelpers.h"
@@ -25,24 +25,24 @@ set(SRC_LIST
 	".editorconfig"
 )
 
-target_sources(${DSP_TARGET} PRIVATE ${SRC_LIST} )
+target_sources(${PSX_REVERB_TARGET} PRIVATE ${SRC_LIST} )
 
 # Require C++17 to support terse static_assert
-target_compile_features(${DSP_TARGET} PRIVATE cxx_std_17)
+target_compile_features(${PSX_REVERB_TARGET} PRIVATE cxx_std_17)
 
 # Define DEBUG in debug builds
-target_compile_definitions(${DSP_TARGET} PRIVATE $<$<CONFIG:Debug>:DEBUG>)
+target_compile_definitions(${PSX_REVERB_TARGET} PRIVATE $<$<CONFIG:Debug>:DEBUG>)
 
 # Define RELEASE in debug builds
-target_compile_definitions(${DSP_TARGET} PRIVATE $<$<CONFIG:Release>:RELEASE>)
+target_compile_definitions(${PSX_REVERB_TARGET} PRIVATE $<$<CONFIG:Release>:RELEASE>)
 
-set_property(TARGET ${DSP_TARGET} PROPERTY COMPILE_WARNING_AS_ERROR ON)
+set_property(TARGET ${PSX_REVERB_TARGET} PROPERTY COMPILE_WARNING_AS_ERROR ON)
 
 # Compiler-specific options
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 
 	target_compile_options(
-		${DSP_TARGET} 
+		${PSX_REVERB_TARGET} 
 		PRIVATE
 		/W4 
 		/wd4127 # conditional expression is constant
@@ -50,12 +50,12 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 	)
 
 	# Allow use of portable fopen (fopen_s is Windows only)
-	target_compile_definitions(${DSP_TARGET} PUBLIC _CRT_SECURE_NO_WARNINGS _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+	target_compile_definitions(${PSX_REVERB_TARGET} PUBLIC _CRT_SECURE_NO_WARNINGS _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU") # GCC
 
 	target_compile_options(
-		${DSP_TARGET} 
+		${PSX_REVERB_TARGET} 
 		PRIVATE 
 		-Wall 
 		-Wextra 
@@ -71,7 +71,7 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU") # GCC
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
 	
 	target_compile_options(
-		${DSP_TARGET} 
+		${PSX_REVERB_TARGET} 
 		PRIVATE 
 		-Wall 
 		-Wextra 
@@ -97,9 +97,9 @@ source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SRC_LIST}) # Requires CMak
 set(DATA_DIR "${PROJECT_SOURCE_DIR}/data")
 
 set_target_properties(
-	${DSP_TARGET} PROPERTIES
+	${PSX_REVERB_TARGET} PROPERTIES
 	VS_DEBUGGER_WORKING_DIRECTORY ${DATA_DIR}
 )
 
 # Default Visual Studio start up project
-set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${DSP_TARGET})
+set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PSX_REVERB_TARGET})
