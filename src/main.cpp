@@ -388,16 +388,18 @@ static s16 saturateS32toS16(s32 val)
 	return (s16)Clamp(val, (s32)INT16_MIN, (s32)INT16_MAX);
 }
 
+//
+// addressDiv8 is relative to the current buffer (head) address
+//
 static inline u32 reverbAddrToRamAddr(const SPU& spu, u16 addressDiv8)
 {
-	u32 addr = spu.currentReverbBufferHead + (addressDiv8 * 8u);
-
-	// The PSX SPU reverb buffer always extends to the end of RAM.
-	if (addr >= SPU::kRamSizeBytes)
-		addr -= spu.reverbBufferSizeBytes;
-
-	HP_ASSERT(addr >= spu.reverbBufferStart && addr < SPU::kRamSizeBytes);
-
+	u32 offset = spu.currentReverbBufferHead + (addressDiv8 * 8u); // relative to current buffer address
+	HP_DEBUG_ASSERT(offset >= spu.reverbBufferStart);
+	offset -= spu.reverbBufferStart;
+	if (spu.reverbBufferSizeBytes > 0)
+		offset = offset % spu.reverbBufferSizeBytes; // Reverb buffer wraps around
+	u32 addr = spu.reverbBufferStart + offset;
+	HP_DEBUG_ASSERT(addr >= spu.reverbBufferStart && addr < SPU::kRamSizeBytes); // The PSX SPU reverb buffer always extends to the end of RAM.
 	return addr;
 }
 
@@ -540,6 +542,7 @@ static s32 applyLateReverb(
 	u16 d_addr, // displacement relative to m_addr. It represents the buffer size i.e. delay time of the late reverb
 	s16 vAPF)
 {
+#if 0
 	u32 addr = reverbAddrToRamAddr(spu, m_addr);
 
 	// Calculate the address of the delayed sample that we will read and write for the APF
@@ -549,6 +552,13 @@ static s32 applyLateReverb(
 		delayedSampleAddrSigned += spu.reverbBufferSizeBytes; // the reverb buffer always extends to the end of RAM, so wrap around to there
 	u32 delayedSampleAddr = (u32)delayedSampleAddrSigned;
 	HP_ASSERT(delayedSampleAddr >= spu.reverbBufferStart && delayedSampleAddr + 2 <= SPU::kRamSizeBytes);
+#else
+	// Do subtraction in register space before converting to RAM address
+	HP_ASSERT(d_addr <= m_addr);
+	u16 delayedSampleOffset = m_addr - d_addr;
+	u32 addr = reverbAddrToRamAddr(spu, m_addr);
+	u32 delayedSampleAddr = reverbAddrToRamAddr(spu, delayedSampleOffset);
+#endif
 
 	// out = in - (vAPF * buf[m_addr-d_addr])
 	s16 delayedSample = readSampleFromRAM(spu, delayedSampleAddr);
